@@ -2,25 +2,17 @@ import SwiftUI
 
 struct MenuBarLabel: View {
     @ObservedObject var viewModel: AppViewModel
-    @State private var currentIndex: Int = 0
 
     private let providers: [Provider] = [.claude, .codex]
-    private let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var body: some View {
         providerChip(provider: currentProvider())
             .font(.system(size: 12, weight: .medium, design: .monospaced))
-            .onReceive(timer) { _ in
-                advance()
-            }
     }
 
     private func currentProvider() -> Provider {
-        providers[currentIndex % providers.count]
-    }
-
-    private func advance() {
-        currentIndex = (currentIndex + 1) % providers.count
+        let idx = ((viewModel.rotationIndex % providers.count) + providers.count) % providers.count
+        return providers[idx]
     }
 
     @ViewBuilder

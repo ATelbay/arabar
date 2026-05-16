@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 @MainActor
 final class AppViewModel: ObservableObject {
@@ -22,13 +23,30 @@ final class AppViewModel: ObservableObject {
     @Published var claudeCookieExpiresAt: Date?
     @Published var codexCookieExpiresAt: Date?
 
+    // MARK: - Menubar rotation
+    // Driven from here so the Timer lives in a stable @StateObject instead of a View struct
+    // (View structs are re-created on every parent re-render, which resets local Timer publishers).
+    @Published var rotationIndex: Int = 0
+    private var rotationTimer: Timer?
+
     private let claudeReader = ClaudeUsageReader()
     private let codexReader = CodexUsageReader()
     private let aggregator = Aggregator()
 
+    // Hoisted cookie readers — avoid re-allocating on every refresh
+    private let claudeCookieReader = ClaudeCookiesReader()
+    private let openaiCookieReader = OpenAICookiesReader()
+
     private var eventBuffer: [UsageEvent] = []
-    private var didInitialRebuild: Bool = false
+    private var isBufferLoaded: Bool = false
+    // Per-provider rebuild tracking to avoid race when both providers run in parallel
+    private var initialRebuildDone: Set<Provider> = []
     private let bufferRetentionHours: Double = 192  // 168h week + 24h safety
+
+    // Sticky-snapshot invalidation: track last-known cookies-enabled state
+    private var lastClaudeCookiesEnabled: Bool
+    private var lastOpenAICookiesEnabled: Bool
+    private var cancellables: Set<AnyCancellable> = []
 
     private let bufferFile: URL = {
         let support = FileManager.default.urls(
@@ -44,7 +62,40 @@ final class AppViewModel: ObservableObject {
     }()
 
     init() {
-        loadBuffer()
+        lastClaudeCookiesEnabled = UserDefaults.standard.bool(forKey: "cookies.enabled.claude")
+        lastOpenAICookiesEnabled = UserDefaults.standard.bool(forKey: "cookies.enabled.openai")
+        let url = bufferFile
+        Task.detached(priority: .userInitiated) {
+            let loaded = Self.loadBufferFromDisk(url: url)
+            await MainActor.run { [weak self] in
+                self?.eventBuffer = loaded
+                self?.isBufferLoaded = true
+            }
+        }
+
+        // Rotation timer (30s) — drives menubar provider cycling
+        rotationTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.rotationIndex = (self?.rotationIndex ?? 0) &+ 1
+            }
+        }
+
+        // Invalidate sticky snapshots when the user toggles cookies in Settings
+        NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                let cookiesClaudeOn = UserDefaults.standard.bool(forKey: "cookies.enabled.claude")
+                let cookiesOpenAIOn = UserDefaults.standard.bool(forKey: "cookies.enabled.openai")
+                if self.lastClaudeCookiesEnabled != cookiesClaudeOn {
+                    self.claudeSnapshot = nil
+                    self.lastClaudeCookiesEnabled = cookiesClaudeOn
+                }
+                if self.lastOpenAICookiesEnabled != cookiesOpenAIOn {
+                    self.codexSnapshot = nil
+                    self.lastOpenAICookiesEnabled = cookiesOpenAIOn
+                }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Public refresh
@@ -76,8 +127,9 @@ final class AppViewModel: ObservableObject {
         self.lastRefreshAt     = now
 
         // Update cookie expiry dates for TTL warning UX
-        self.claudeCookieExpiresAt = await Task.detached { CookieExpiry.forProvider(.claude) }.value
-        self.codexCookieExpiresAt  = await Task.detached { CookieExpiry.forProvider(.codex) }.value
+        // CookieExpiry.forProvider is pure sync — structured Task is fine here
+        self.claudeCookieExpiresAt = await Task { CookieExpiry.forProvider(.claude) }.value
+        self.codexCookieExpiresAt  = await Task { CookieExpiry.forProvider(.codex) }.value
 
         // Override primary snapshot to API tier if user selected "api" as display source
         if claudeDisplaySource == "api", let apiSnap = claudeApiSnapshot {
@@ -94,9 +146,6 @@ final class AppViewModel: ObservableObject {
     /// If the new snapshot is useful (has authoritative percentSource), it wins.
     /// If the new snapshot is transient/degraded but the current one is useful, keep the current one.
     /// This prevents a single bad refresh cycle from flickering the display to ukwn/estimated.
-    ///
-    /// TODO: If the user disables cookies in Settings, the sticky cookies snapshot will persist until
-    /// process restart. Invalidation on settings change is out of scope.
     private func preferUseful(new: UsageSnapshot?, current: UsageSnapshot?) -> UsageSnapshot? {
         guard let current = current else { return new }
         if isUseful(new) { return new }
@@ -121,9 +170,9 @@ final class AppViewModel: ObservableObject {
                 let cookiesSnap: UsageSnapshot
                 switch provider {
                 case .claude:
-                    cookiesSnap = try await ClaudeCookiesReader().fetchSnapshot()
+                    cookiesSnap = try await claudeCookieReader.fetchSnapshot()
                 case .codex:
-                    cookiesSnap = try await OpenAICookiesReader().fetchSnapshot()
+                    cookiesSnap = try await openaiCookieReader.fetchSnapshot()
                 }
                 let jsonlSnap = await jsonlTask
                 return mergedSnapshot(cookies: cookiesSnap, jsonl: jsonlSnap)
@@ -153,11 +202,14 @@ final class AppViewModel: ObservableObject {
     }
 
     /// Cookies supplies authoritative % and resetAt; JSONL supplies real token counts and cost.
+    /// When JSONL has zero tokens (no local log yet), fall back to cookies.tokensUsed for semantic correctness.
     private func mergedWindow(cookies: WindowSnapshot, jsonl: WindowSnapshot) -> WindowSnapshot {
+        let tokens = jsonl.tokensUsed > 0 ? jsonl.tokensUsed : cookies.tokensUsed
+        let cost   = jsonl.tokensUsed > 0 ? jsonl.costUSD    : cookies.costUSD
         return WindowSnapshot(
             durationHours: cookies.durationHours,
-            tokensUsed: jsonl.tokensUsed,
-            costUSD: jsonl.costUSD,
+            tokensUsed: tokens,
+            costUSD: cost,
             percentUsed: cookies.percentUsed,
             resetAt: cookies.resetAt,
             percentSource: cookies.percentSource
@@ -186,20 +238,23 @@ final class AppViewModel: ObservableObject {
     // MARK: - JSONL per-provider snapshot
 
     private func jsonlSnapshot(for provider: Provider, now: Date) async -> UsageSnapshot? {
-        let needsRebuild = eventBuffer.isEmpty && !didInitialRebuild
-        didInitialRebuild = true
+        guard isBufferLoaded else { return nil }
+        let needsRebuild = eventBuffer.isEmpty && !initialRebuildDone.contains(provider)
+        initialRebuildDone.insert(provider)
 
         let newEvents: [UsageEvent]
         do {
             switch provider {
             case .claude:
-                newEvents = needsRebuild
-                    ? try claudeReader.rebuildAll()
-                    : try claudeReader.fetchNewEvents()
+                let reader = claudeReader
+                newEvents = try await Task.detached(priority: .userInitiated) {
+                    needsRebuild ? try reader.rebuildAll() : try reader.fetchNewEvents()
+                }.value
             case .codex:
-                newEvents = needsRebuild
-                    ? try codexReader.rebuildAll()
-                    : try codexReader.fetchNewEvents()
+                let reader = codexReader
+                newEvents = try await Task.detached(priority: .userInitiated) {
+                    needsRebuild ? try reader.rebuildAll() : try reader.fetchNewEvents()
+                }.value
             }
         } catch {
             self.lastError = "\(provider) JSONL: \(error.localizedDescription)"
@@ -222,18 +277,29 @@ final class AppViewModel: ObservableObject {
         eventBuffer.removeAll { $0.timestamp < cutoff }
     }
 
-    private func loadBuffer() {
-        guard let data = try? Data(contentsOf: bufferFile) else { return }
+    private nonisolated static func loadBufferFromDisk(url: URL) -> [UsageEvent] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        guard let data = try? Data(contentsOf: url) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        eventBuffer = (try? decoder.decode([UsageEvent].self, from: data)) ?? []
-        pruneOldEvents(now: Date())
+        let events = (try? decoder.decode([UsageEvent].self, from: data)) ?? []
+        let cutoff = Date().addingTimeInterval(-192 * 3600)
+        return events.filter { $0.timestamp >= cutoff }
     }
 
     private func saveBuffer() {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(eventBuffer) else { return }
-        try? data.write(to: bufferFile, options: .atomic)
+        guard !eventBuffer.isEmpty else { return }
+        let snapshot = eventBuffer
+        let url = bufferFile
+        Task.detached(priority: .background) {
+            do {
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                let data = try encoder.encode(snapshot)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                // silently fail — next refresh retries
+            }
+        }
     }
 }

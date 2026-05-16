@@ -30,6 +30,16 @@ struct MenuContentView: View {
             // ── Claude API secondary section (only when distinct) ────────
             if let apiSnap = viewModel.claudeApiSnapshot, apiSnap != viewModel.claudeSnapshot {
                 Divider().padding(.vertical, 4)
+                if viewModel.claudeSnapshot != nil {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                            .font(.caption2)
+                        Text("Subscription + API may count same tokens twice")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
                 providerSection(
                     icon: "bolt.circle",
                     title: "Claude API",
@@ -53,6 +63,16 @@ struct MenuContentView: View {
             // ── OpenAI API secondary section (only when distinct) ────────
             if let apiSnap = viewModel.codexApiSnapshot, apiSnap != viewModel.codexSnapshot {
                 Divider().padding(.vertical, 4)
+                if viewModel.codexSnapshot != nil {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                            .font(.caption2)
+                        Text("Subscription + API may count same tokens twice")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
                 providerSection(
                     icon: "bolt.circle",
                     title: "OpenAI API",

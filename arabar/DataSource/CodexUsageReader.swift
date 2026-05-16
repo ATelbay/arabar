@@ -2,7 +2,8 @@ import Foundation
 
 // MARK: - CodexUsageReader
 
-final class CodexUsageReader {
+// Single-owner serial access from AppViewModel — safe to treat as Sendable
+final class CodexUsageReader: @unchecked Sendable {
 
     // MARK: - Cache types
 

@@ -56,24 +56,76 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - Claude Tab
+// MARK: - Provider tab config
 
-struct ClaudeSettingsTab: View {
-    // Cookies
-    @AppStorage("cookies.enabled.claude") private var cookiesEnabled: Bool = false
-    @AppStorage("cookies.source.claude") private var browserSource: String = "safari"
+private struct ProviderTabConfig {
+    let cookiesEnabledKey: String
+    let cookiesSourceKey: String
+    let displaySourceKey: String
+    let apiKeyAccount: String
+    let cookieHosts: [String]
+    let cookieName: String
+    let apiKeyPlaceholder: String
+    let consoleURL: URL
+    let cookiesPrivacyNote: String
+    let testCookies: () async -> String
+    let testAPI: () async -> String
+}
+
+extension ProviderTabConfig {
+    static let claude = ProviderTabConfig(
+        cookiesEnabledKey:  "cookies.enabled.claude",
+        cookiesSourceKey:   "cookies.source.claude",
+        displaySourceKey:   "display.source.claude",
+        apiKeyAccount:      KeychainAccount.anthropicAdminKey,
+        cookieHosts:        ["claude.ai"],
+        cookieName:         "sessionKey",
+        apiKeyPlaceholder:  "sk-ant-admin-…",
+        consoleURL:         URL(string: "https://console.anthropic.com/settings/admin-keys")!,
+        cookiesPrivacyNote: "Cookies are read locally and used only for requests to claude.ai. They are never sent to third parties.",
+        testCookies:        { await ClaudeCookiesReader().testConnection() },
+        testAPI:            { await AnthropicAdminAPIReader().testConnection() }
+    )
+
+    static let openai = ProviderTabConfig(
+        cookiesEnabledKey:  "cookies.enabled.openai",
+        cookiesSourceKey:   "cookies.source.openai",
+        displaySourceKey:   "display.source.openai",
+        apiKeyAccount:      KeychainAccount.openaiAdminKey,
+        cookieHosts:        ["chatgpt.com"],
+        cookieName:         "__Secure-next-auth.session-token",
+        apiKeyPlaceholder:  "sk-admin-…",
+        consoleURL:         URL(string: "https://platform.openai.com/settings/organization/admin-keys")!,
+        cookiesPrivacyNote: "Cookies are read locally and used only for requests to chatgpt.com. They are never sent to third parties.",
+        testCookies:        { await OpenAICookiesReader().testConnection() },
+        testAPI:            { await OpenAIUsageAPIReader().testConnection() }
+    )
+}
+
+// MARK: - Shared provider tab
+
+private struct ProviderSettingsTab: View {
+    let config: ProviderTabConfig
+
+    @AppStorage private var cookiesEnabled: Bool
+    @AppStorage private var browserSource: String
+    @AppStorage private var displaySource: String
+
     @State private var cookiesStatus: String = ""
     @State private var cookiesTesting: Bool = false
-    @State private var claudeCookieExpiry: String? = nil
+    @State private var cookieExpiry: String? = nil
 
-    // Admin API key
     @State private var apiKey: String = ""
     @State private var apiKeyHasValue: Bool = false
     @State private var apiStatus: String = ""
     @State private var apiTesting: Bool = false
 
-    // Display preference
-    @AppStorage("display.source.claude") private var displaySource: String = "subscription"
+    init(config: ProviderTabConfig) {
+        self.config = config
+        self._cookiesEnabled = AppStorage(wrappedValue: false, config.cookiesEnabledKey)
+        self._browserSource  = AppStorage(wrappedValue: "safari", config.cookiesSourceKey)
+        self._displaySource  = AppStorage(wrappedValue: "subscription", config.displaySourceKey)
+    }
 
     var body: some View {
         Form {
@@ -96,11 +148,11 @@ struct ClaudeSettingsTab: View {
                     Button("Test connection") {
                         Task {
                             cookiesTesting = true
-                            cookiesStatus = await ClaudeCookiesReader().testConnection()
-                            claudeCookieExpiry = cookieExpiryStatus(
+                            cookiesStatus = await config.testCookies()
+                            cookieExpiry = cookieExpiryStatus(
                                 for: browserSource,
-                                hosts: ["claude.ai"],
-                                cookieName: "sessionKey"
+                                hosts: config.cookieHosts,
+                                cookieName: config.cookieName
                             )
                             cookiesTesting = false
                         }
@@ -118,8 +170,7 @@ struct ClaudeSettingsTab: View {
                     }
                 }
 
-                // Cookie expiry row (Safari only, shown after Test)
-                if let expiry = claudeCookieExpiry {
+                if let expiry = cookieExpiry {
                     HStack(spacing: 4) {
                         Image(systemName: "calendar")
                             .foregroundColor(expiryColor(expiry))
@@ -129,7 +180,7 @@ struct ClaudeSettingsTab: View {
                     }
                 }
 
-                Text("Cookies are read locally and used only for requests to claude.ai. They are never sent to third parties.")
+                Text(config.cookiesPrivacyNote)
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -140,10 +191,9 @@ struct ClaudeSettingsTab: View {
 
             // ── Admin API ────────────────────────────────────────────────
             Section {
-                SecureField("sk-ant-admin-…", text: $apiKey)
+                SecureField(config.apiKeyPlaceholder, text: $apiKey)
                     .textFieldStyle(.roundedBorder)
 
-                // Green saved indicator: visible when key is stored and user hasn't started typing a new one
                 if apiKeyHasValue && apiKey.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.circle.fill")
@@ -156,7 +206,7 @@ struct ClaudeSettingsTab: View {
 
                 HStack(spacing: 8) {
                     Button("Save") {
-                        try? KeychainStore.set(apiKey, for: KeychainAccount.anthropicAdminKey)
+                        try? KeychainStore.set(apiKey, for: config.apiKeyAccount)
                         apiKey = ""
                         apiKeyHasValue = true
                         apiStatus = "Saved"
@@ -164,7 +214,7 @@ struct ClaudeSettingsTab: View {
                     .disabled(apiKey.isEmpty)
 
                     Button("Clear") {
-                        KeychainStore.delete(account: KeychainAccount.anthropicAdminKey)
+                        KeychainStore.delete(account: config.apiKeyAccount)
                         apiKey = ""
                         apiKeyHasValue = false
                         apiStatus = ""
@@ -174,7 +224,7 @@ struct ClaudeSettingsTab: View {
                     Button("Test connection") {
                         Task {
                             apiTesting = true
-                            apiStatus = await AnthropicAdminAPIReader().testConnection()
+                            apiStatus = await config.testAPI()
                             apiTesting = false
                         }
                     }
@@ -191,8 +241,8 @@ struct ClaudeSettingsTab: View {
                         .foregroundColor(.secondary)
                 }
 
-                Link("Create Admin key at console.anthropic.com →",
-                     destination: URL(string: "https://console.anthropic.com/settings/admin-keys")!)
+                Link("Create Admin key at \(config.consoleURL.host ?? "") →",
+                     destination: config.consoleURL)
                     .font(.caption)
 
             } header: {
@@ -219,177 +269,21 @@ struct ClaudeSettingsTab: View {
         .formStyle(.grouped)
         .padding()
         .onAppear {
-            apiKeyHasValue = KeychainStore.has(account: KeychainAccount.anthropicAdminKey)
+            apiKeyHasValue = KeychainStore.has(account: config.apiKeyAccount)
         }
     }
+}
+
+// MARK: - Claude Tab
+
+struct ClaudeSettingsTab: View {
+    var body: some View { ProviderSettingsTab(config: .claude) }
 }
 
 // MARK: - OpenAI Tab
 
 struct OpenAISettingsTab: View {
-    // Cookies
-    @AppStorage("cookies.enabled.openai") private var cookiesEnabled: Bool = false
-    @AppStorage("cookies.source.openai") private var browserSource: String = "safari"
-    @State private var cookiesStatus: String = ""
-    @State private var cookiesTesting: Bool = false
-    @State private var openaiCookieExpiry: String? = nil
-
-    // Admin API key
-    @State private var apiKey: String = ""
-    @State private var apiKeyHasValue: Bool = false
-    @State private var apiStatus: String = ""
-    @State private var apiTesting: Bool = false
-
-    // Display preference
-    @AppStorage("display.source.openai") private var displaySource: String = "subscription"
-
-    var body: some View {
-        Form {
-            // ── Subscription (browser cookies) ──────────────────────────
-            Section {
-                Toggle("Use browser session cookies", isOn: $cookiesEnabled)
-
-                if cookiesEnabled {
-                    Picker("Browser", selection: $browserSource) {
-                        Text("Safari").tag("safari")
-                        Text("Chrome").tag("chrome")
-                        Text("Brave").tag("brave")
-                        Text("Edge").tag("edge")
-                    }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: 200)
-                }
-
-                HStack(spacing: 8) {
-                    Button("Test connection") {
-                        Task {
-                            cookiesTesting = true
-                            cookiesStatus = await OpenAICookiesReader().testConnection()
-                            openaiCookieExpiry = cookieExpiryStatus(
-                                for: browserSource,
-                                hosts: ["chatgpt.com"],
-                                cookieName: "__Secure-next-auth.session-token"
-                            )
-                            cookiesTesting = false
-                        }
-                    }
-                    .disabled(!cookiesEnabled || cookiesTesting)
-
-                    if cookiesTesting {
-                        ProgressView().scaleEffect(0.6).frame(width: 16, height: 16)
-                    }
-
-                    if !cookiesStatus.isEmpty {
-                        Text(cookiesStatus)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                // Cookie expiry row (Safari only, shown after Test)
-                if let expiry = openaiCookieExpiry {
-                    HStack(spacing: 4) {
-                        Image(systemName: "calendar")
-                            .foregroundColor(expiryColor(expiry))
-                        Text(expiry)
-                            .font(.caption)
-                            .foregroundColor(expiryColor(expiry))
-                    }
-                }
-
-                Text("Cookies are read locally and used only for requests to chatgpt.com. They are never sent to third parties.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-            } header: {
-                Text("Subscription (browser cookies)")
-            }
-
-            // ── Admin API ────────────────────────────────────────────────
-            Section {
-                SecureField("sk-admin-…", text: $apiKey)
-                    .textFieldStyle(.roundedBorder)
-
-                // Green saved indicator: visible when key is stored and user hasn't started typing a new one
-                if apiKeyHasValue && apiKey.isEmpty {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("API key saved in Keychain")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    Button("Save") {
-                        try? KeychainStore.set(apiKey, for: KeychainAccount.openaiAdminKey)
-                        apiKey = ""
-                        apiKeyHasValue = true
-                        apiStatus = "Saved"
-                    }
-                    .disabled(apiKey.isEmpty)
-
-                    Button("Clear") {
-                        KeychainStore.delete(account: KeychainAccount.openaiAdminKey)
-                        apiKey = ""
-                        apiKeyHasValue = false
-                        apiStatus = ""
-                    }
-                    .disabled(!apiKeyHasValue)
-
-                    Button("Test connection") {
-                        Task {
-                            apiTesting = true
-                            apiStatus = await OpenAIUsageAPIReader().testConnection()
-                            apiTesting = false
-                        }
-                    }
-                    .disabled(!apiKeyHasValue || apiTesting)
-
-                    if apiTesting {
-                        ProgressView().scaleEffect(0.6).frame(width: 16, height: 16)
-                    }
-                }
-
-                if !apiStatus.isEmpty {
-                    Text(apiStatus)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Link("Create Admin key at platform.openai.com →",
-                     destination: URL(string: "https://platform.openai.com/settings/organization/admin-keys")!)
-                    .font(.caption)
-
-            } header: {
-                Text("API tier (pay-as-you-go)")
-            }
-
-            // ── Display preference ───────────────────────────────────────
-            Section {
-                Picker("Show in menubar", selection: $displaySource) {
-                    Text("Subscription").tag("subscription")
-                    Text("API tier").tag("api")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-
-                Text("Choose which source drives the menubar display.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-            } header: {
-                Text("Display in menubar")
-            }
-        }
-        .formStyle(.grouped)
-        .padding()
-        .onAppear {
-            apiKeyHasValue = KeychainStore.has(account: KeychainAccount.openaiAdminKey)
-        }
-    }
+    var body: some View { ProviderSettingsTab(config: .openai) }
 }
 
 // MARK: - About Tab

@@ -179,6 +179,7 @@ final class OpenAIUsageAPIReader {
         }
 
         var request = URLRequest(url: url)
+        request.timeoutInterval = 15
         request.httpMethod = "GET"
         // Log only prefix — never the full key
         let keyPrefix = String(key.prefix(11)) + "..."

@@ -1,23 +1,8 @@
 import Foundation
-import Security
 import SQLite3
-import CommonCrypto
 import os.log
 
 private let openaiLog = OSLog(subsystem: "com.arystantelbay.arabar", category: "cookies-openai")
-
-// MARK: - Browser source
-
-/// Supported browser sources for OpenAI cookie reading.
-/// NOTE: If BrowserSource is also defined in ClaudeCookiesReader (parallel T10 agent),
-/// rename this to OpenAIBrowserSource to avoid collision.
-// TODO: share with ClaudeCookiesReader once both readers stabilise
-enum OpenAIBrowserSource: String {
-    case safari
-    case chrome
-    case brave
-    case edge
-}
 
 // MARK: - Errors
 
@@ -124,7 +109,7 @@ final class OpenAICookiesReader {
             throw OpenAICookiesError.disabled
         }
 
-        let source = OpenAIBrowserSource(
+        let source = BrowserSource(
             rawValue: UserDefaults.standard.string(forKey: Self.sourceKey) ?? "safari"
         ) ?? .safari
 
@@ -138,7 +123,7 @@ final class OpenAICookiesReader {
             return "Disabled (opt-in not set)"
         }
         do {
-            let source = OpenAIBrowserSource(
+            let source = BrowserSource(
                 rawValue: UserDefaults.standard.string(forKey: Self.sourceKey) ?? "safari"
             ) ?? .safari
             let cookieStr = try extractCookieHeader(from: source)
@@ -174,16 +159,16 @@ final class OpenAICookiesReader {
     private func mapSafariError<T>(_ body: () throws -> T) throws -> T {
         do {
             return try body()
-        } catch SafariCookiesError.fileNotFound {
-            throw OpenAICookiesError.cookiesNotFound
-        } catch SafariCookiesError.accessDenied {
-            throw OpenAICookiesError.accessDenied
-        } catch SafariCookiesError.invalidFormat(let msg) {
-            throw OpenAICookiesError.parsingFailed(msg)
+        } catch let e as SafariCookiesError {
+            switch e.category {
+            case .fileNotFound:           throw OpenAICookiesError.cookiesNotFound
+            case .accessDenied:           throw OpenAICookiesError.accessDenied
+            case .invalidFormat(let msg): throw OpenAICookiesError.parsingFailed(msg)
+            }
         }
     }
 
-    private func extractCookieHeader(from source: OpenAIBrowserSource) throws -> String {
+    private func extractCookieHeader(from source: BrowserSource) throws -> String {
         switch source {
         case .chrome:
             return try chromeLikeCookieHeaderFromProfiles(
@@ -216,41 +201,19 @@ final class OpenAICookiesReader {
 
     // MARK: - Profile path enumeration
 
-    /// Returns existing Cookies paths for all valid profiles under a Chromium User Data root.
-    private func profileCookiesPaths(underRoot root: String) -> [String] {
-        let fm = FileManager.default
-        var results: [String] = []
-        let defaultPath = "\(root)/Default/Cookies"
-        if fm.fileExists(atPath: defaultPath) { results.append(defaultPath) }
-
-        guard let entries = try? fm.contentsOfDirectory(atPath: root) else { return results }
-        let profileDirs = entries
-            .filter { $0.hasPrefix("Profile ") && $0.dropFirst(8).allSatisfy(\.isNumber) }
-            .sorted { a, b in
-                let na = Int(a.dropFirst(8)) ?? 0
-                let nb = Int(b.dropFirst(8)) ?? 0
-                return na < nb
-            }
-        for dir in profileDirs {
-            let p = "\(root)/\(dir)/Cookies"
-            if fm.fileExists(atPath: p) { results.append(p) }
-        }
-        return results
-    }
-
     private func chromeProfileCookiesPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Google/Chrome")
+        return ChromiumCookieDB.profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Google/Chrome")
     }
 
     private func braveProfileCookiesPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return profileCookiesPaths(underRoot: "\(home)/Library/Application Support/BraveSoftware/Brave-Browser")
+        return ChromiumCookieDB.profileCookiesPaths(underRoot: "\(home)/Library/Application Support/BraveSoftware/Brave-Browser")
     }
 
     private func edgeProfileCookiesPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Microsoft Edge")
+        return ChromiumCookieDB.profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Microsoft Edge")
     }
 
     // MARK: - Chrome cookie extraction (multi-profile)
@@ -281,54 +244,43 @@ final class OpenAICookiesReader {
     }
 
     private func chromeCookieHeaderFromDB(path: String, aesKeys: [Data]) throws -> String {
-        // Always copy — Chrome may lock the file
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("arabar_openai_cookies_\(UUID().uuidString).db")
-        defer { try? FileManager.default.removeItem(at: tmp) }
+        let tmp: URL
         do {
-            try FileManager.default.copyItem(atPath: path, toPath: tmp.path)
+            // Always copy — Chrome may lock the file
+            tmp = try {
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("arabar_\(UUID().uuidString).db")
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: url)
+                return url
+            }()
         } catch {
             throw OpenAICookiesError.cookiesNotFound
         }
+        defer { try? FileManager.default.removeItem(at: tmp) }
 
         var db: OpaquePointer?
         guard sqlite3_open_v2(tmp.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
             throw OpenAICookiesError.cookiesNotFound
         }
         defer { sqlite3_close(db) }
-        let dbVersion = readCookieDBVersion(db: db!)
+        let dbVersion = ChromiumCookieDB.readCookieDBVersion(db: db!)
         let hasHashPrefix = dbVersion >= 24
         debugLog(openaiLog, "DB meta version=\(dbVersion), hasHashPrefix=\(hasHashPrefix ? "YES" : "NO")")
         return try extractChromeCookies(db: db!, aesKeys: aesKeys, hasHashPrefix: hasHashPrefix)
     }
 
-    /// Reads the schema version from the Cookies DB meta table.
-    /// Chrome 130+ (DB version ≥ 24) prepends a 32-byte SHA256(host_key) to each cookie value before encryption.
-    private func readCookieDBVersion(db: OpaquePointer) -> Int {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = 'version'", -1, &stmt, nil) == SQLITE_OK else { return 0 }
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
-        if let raw = sqlite3_column_text(stmt, 0) {
-            return Int(String(cString: raw)) ?? 0
-        }
-        return 0
-    }
-
     private func extractChromeCookies(db: OpaquePointer, aesKeys: [Data], hasHashPrefix: Bool) throws -> String {
         // Match exact prefix; ORDER BY name gives .0, .1, … in order
-        let sql = """
-            SELECT name, value, encrypted_value
-            FROM cookies
-            WHERE host_key LIKE '%chatgpt.com%'
-            AND name LIKE '\(Self.sessionCookiePrefix)%'
-            ORDER BY name
-        """
+        let sql = "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE ?1 AND name LIKE ?2 ORDER BY name"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw OpenAICookiesError.parsingFailed("SQLite prepare failed")
         }
         defer { sqlite3_finalize(stmt) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(stmt, 1, "%chatgpt.com%", -1, transient)
+        let namePattern = Self.sessionCookiePrefix + "%"
+        sqlite3_bind_text(stmt, 2, namePattern, -1, transient)
 
         let keylens = aesKeys.map { $0.count }.map(String.init).joined(separator: ",")
         debugLog(openaiLog, "keychain candidates: \(aesKeys.count), keylens=[\(keylens)]")
@@ -355,7 +307,7 @@ final class OpenAICookiesReader {
                     }
                     for (idx, key) in aesKeys.enumerated() {
                         do {
-                            let plaintext = try decryptChromeValue(encData, key: key, hasHashPrefix: hasHashPrefix)
+                            let plaintext = try ChromiumCookieDB.decryptChromeCookieBlob(encData, key: key, hasHashPrefix: hasHashPrefix)
                             let valid = plaintext.count > 20
                             debugLog(openaiLog, "key #\(idx) → decrypt OK, len=\(plaintext.count), valid=\(valid ? "YES" : "NO")")
                             if valid { value = plaintext; break }
@@ -407,158 +359,15 @@ final class OpenAICookiesReader {
     // MARK: - Chrome AES key
 
     /// Reads all Chrome Safe Storage entries from the system keychain and derives one AES-128-CBC
-    /// key per non-empty password. Returns an array so callers can try each in turn.
+    /// key per non-empty password via ChromiumKeychain. Returns an array so callers can try each in turn.
     private func chromeAESKeys(account: String, service: String) throws -> [Data] {
-        // Gather candidate password blobs — native API first, CLI fallback
-        var passwordCandidates: [Data] = []
-
-        if let nativeCandidates = try? readKeychainNativeAll(service: service, account: account),
-           !nativeCandidates.isEmpty {
-            passwordCandidates = nativeCandidates
-        } else if let cliData = try? readKeychainViaSecurityCLI(service: service, account: account) {
-            passwordCandidates = [cliData]
-        }
-
+        let passwordCandidates = ChromiumKeychain.readAllCandidateKeys(service: service, account: account)
         guard !passwordCandidates.isEmpty else {
             throw OpenAICookiesError.keychainAccessDenied
         }
-
-        // Derive a 16-byte AES key for each candidate password
-        var keys: [Data] = []
-        for passwordData in passwordCandidates {
-            guard let password = String(data: passwordData, encoding: .utf8) else { continue }
-            if let key = try? pbkdf2Key(password: password) {
-                keys.append(key)
-            }
-        }
-
+        let keys = passwordCandidates.compactMap { ChromiumKeychain.deriveAESKey(from: $0) }
         guard !keys.isEmpty else { throw OpenAICookiesError.decryptionFailed }
         return keys
-    }
-
-    /// Enumerates ALL matching Keychain entries and returns their non-empty password Data values.
-    private func readKeychainNativeAll(service: String, account: String) throws -> [Data] {
-        let query: [String: Any] = [
-            kSecClass as String:        kSecClassGenericPassword,
-            kSecAttrService as String:  service,
-            kSecAttrAccount as String:  account,
-            kSecReturnData as String:   true,
-            kSecMatchLimit as String:   kSecMatchLimitAll
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else {
-            throw OpenAICookiesError.keychainAccessDenied
-        }
-        // kSecMatchLimitAll returns an array of Data when kSecReturnData is true
-        if let array = result as? [Data] {
-            return array.filter { !$0.isEmpty }
-        }
-        // Single result returned as plain Data
-        if let single = result as? Data, !single.isEmpty {
-            return [single]
-        }
-        return []
-    }
-
-    private func readKeychainViaSecurityCLI(service: String, account: String) throws -> Data {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-w", "-s", service, "-a", account]
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw OpenAICookiesError.keychainAccessDenied
-        }
-        let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let trimmed = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !trimmed.isEmpty else {
-            throw OpenAICookiesError.keychainAccessDenied
-        }
-        return Data(trimmed.utf8)
-    }
-
-    /// Derives 16-byte AES key: PBKDF2-SHA1, salt="saltysalt", 1003 iterations.
-    private func pbkdf2Key(password: String) throws -> Data {
-        let salt = Data("saltysalt".utf8)
-        let keyLen = 16
-        var derivedKey = Data(repeating: 0, count: keyLen)
-        let passData = Data(password.utf8)
-
-        let status: Int32 = passData.withUnsafeBytes { passPtr in
-            salt.withUnsafeBytes { saltPtr in
-                derivedKey.withUnsafeMutableBytes { keyPtr in
-                    CCKeyDerivationPBKDF(
-                        CCPBKDFAlgorithm(kCCPBKDF2),
-                        passPtr.baseAddress!.assumingMemoryBound(to: Int8.self),
-                        passData.count,
-                        saltPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                        salt.count,
-                        CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1),
-                        1003,
-                        keyPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                        keyLen
-                    )
-                }
-            }
-        }
-
-        guard status == kCCSuccess else { throw OpenAICookiesError.decryptionFailed }
-        return derivedKey
-    }
-
-    // MARK: - AES-128-CBC decryption
-
-    /// Decrypts a Chrome encrypted cookie value.
-    /// Format (v10/v11 prefix): `v10` or `v11` + 3-byte prefix + AES-CBC ciphertext.
-    private func decryptChromeValue(_ data: Data, key: Data, hasHashPrefix: Bool) throws -> String {
-        guard data.count > 3 else { throw OpenAICookiesError.decryptionFailed }
-        let prefix = String(data: data.prefix(3), encoding: .utf8) ?? ""
-        let ciphertext: Data
-        if prefix == "v10" || prefix == "v11" {
-            ciphertext = data.dropFirst(3)
-        } else {
-            ciphertext = data
-        }
-
-        let iv = Data(repeating: 0x20, count: 16)
-
-        let outputCapacity = ciphertext.count + kCCBlockSizeAES128
-        var outputBuf = Data(repeating: 0, count: outputCapacity)
-        var decryptedLen = 0
-
-        let status: CCCryptorStatus = key.withUnsafeBytes { keyPtr in
-            iv.withUnsafeBytes { ivPtr in
-                ciphertext.withUnsafeBytes { ctPtr in
-                    outputBuf.withUnsafeMutableBytes { outPtr in
-                        CCCrypt(
-                            CCOperation(kCCDecrypt),
-                            CCAlgorithm(kCCAlgorithmAES),
-                            CCOptions(kCCOptionPKCS7Padding),
-                            keyPtr.baseAddress!, key.count,
-                            ivPtr.baseAddress!,
-                            ctPtr.baseAddress!, ciphertext.count,
-                            outPtr.baseAddress!, outputCapacity,
-                            &decryptedLen
-                        )
-                    }
-                }
-            }
-        }
-
-        guard status == kCCSuccess else { throw OpenAICookiesError.decryptionFailed }
-        outputBuf = outputBuf.prefix(decryptedLen)
-        if hasHashPrefix && outputBuf.count > 32 {
-            outputBuf = outputBuf.dropFirst(32)
-        }
-        guard let plaintext = String(data: outputBuf, encoding: .utf8) else {
-            throw OpenAICookiesError.decryptionFailed
-        }
-        return plaintext
     }
 
     // MARK: - HTTP requests

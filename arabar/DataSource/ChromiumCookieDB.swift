@@ -1,8 +1,18 @@
 import Foundation
+import CommonCrypto
 import SQLite3
 import os.log
 
 private let chromiumLog = OSLog(subsystem: "com.arystantelbay.arabar", category: "cookies-chromium-expiry")
+
+// MARK: - Shared decrypt error
+
+/// Errors thrown by ChromiumCookieDB.decryptChromeCookieBlob.
+enum ChromiumDecryptError: Error {
+    case invalidPrefix
+    case decryptionFailed(OSStatus)
+    case invalidPlaintext
+}
 
 enum ChromiumCookieDB {
 
@@ -34,7 +44,8 @@ enum ChromiumCookieDB {
 
     // MARK: - Profile enumeration
 
-    private static func profileCookiesPaths(underRoot root: String) -> [String] {
+    /// Returns all existing Cookies DB paths under a Chromium User Data root (Default first, then Profile N in order).
+    static func profileCookiesPaths(underRoot root: String) -> [String] {
         let fm = FileManager.default
         var results: [String] = []
         let defaultPath = "\(root)/Default/Cookies"
@@ -110,6 +121,72 @@ enum ChromiumCookieDB {
         return date
     }
 
+    // MARK: - Shared helpers (used by ClaudeCookiesReader + OpenAICookiesReader)
+
+    /// Reads the schema version from a Cookies DB meta table.
+    /// Chrome 130+ (DB schema version ≥ 24) prepends a 32-byte SHA256(host_key) to each plaintext cookie value.
+    static func readCookieDBVersion(db: OpaquePointer) -> Int {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = 'version'", -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        if let raw = sqlite3_column_text(stmt, 0) {
+            return Int(String(cString: raw)) ?? 0
+        }
+        return 0
+    }
+
+    /// Decrypts a Chromium AES-128-CBC cookie blob.
+    /// Checks for "v10"/"v11" prefix and strips it; if prefix is neither, treats entire blob as ciphertext.
+    /// IV = 16 space characters (0x20). PKCS7 padding.
+    /// When `hasHashPrefix` is true (DB version ≥ 24), drops the leading 32-byte SHA256(host_key) from plaintext.
+    static func decryptChromeCookieBlob(_ data: Data, key: Data, hasHashPrefix: Bool) throws -> String {
+        guard data.count > 3 else { throw ChromiumDecryptError.invalidPrefix }
+        let prefix = String(data: data.prefix(3), encoding: .utf8) ?? ""
+        let ciphertext: Data
+        if prefix == "v10" || prefix == "v11" {
+            ciphertext = data.dropFirst(3)
+        } else {
+            ciphertext = data
+        }
+
+        let iv = Data(repeating: 0x20, count: 16)
+        let outputCapacity = ciphertext.count + kCCBlockSizeAES128
+        var outputBuf = Data(repeating: 0, count: outputCapacity)
+        var decryptedLen = 0
+
+        let status: CCCryptorStatus = key.withUnsafeBytes { keyPtr in
+            iv.withUnsafeBytes { ivPtr in
+                ciphertext.withUnsafeBytes { ctPtr in
+                    outputBuf.withUnsafeMutableBytes { outPtr in
+                        CCCrypt(
+                            CCOperation(kCCDecrypt),
+                            CCAlgorithm(kCCAlgorithmAES),
+                            CCOptions(kCCOptionPKCS7Padding),
+                            keyPtr.baseAddress!, key.count,
+                            ivPtr.baseAddress!,
+                            ctPtr.baseAddress!, ciphertext.count,
+                            outPtr.baseAddress!, outputCapacity,
+                            &decryptedLen
+                        )
+                    }
+                }
+            }
+        }
+
+        guard status == kCCSuccess else {
+            throw ChromiumDecryptError.decryptionFailed(status)
+        }
+        outputBuf = outputBuf.prefix(decryptedLen)
+        if hasHashPrefix && outputBuf.count > 32 {
+            outputBuf = outputBuf.dropFirst(32)
+        }
+        guard let plaintext = String(data: outputBuf, encoding: .utf8) else {
+            throw ChromiumDecryptError.invalidPlaintext
+        }
+        return plaintext
+    }
+
     // MARK: - Temp copy (avoids DB lock while browser is running)
 
     private static func copyToTemp(_ path: String) -> URL? {
@@ -122,5 +199,15 @@ enum ChromiumCookieDB {
             debugLog(chromiumLog, "Failed to copy DB \(path): \(error)")
             return nil
         }
+    }
+
+    /// Copies the SQLite DB at `sourcePath` to a temp location, calls `body` with the temp URL,
+    /// then deletes the temp file. Use this to avoid locking a live browser DB.
+    static func withTempCopy<T>(of sourcePath: String, _ body: (URL) throws -> T) throws -> T {
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("arabar_\(UUID().uuidString).db")
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: sourcePath), to: tmpURL)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+        return try body(tmpURL)
     }
 }

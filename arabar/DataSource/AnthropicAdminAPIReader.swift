@@ -61,25 +61,7 @@ final class AnthropicAdminAPIReader {
 
     private let session: URLSession
 
-    // Shared ISO8601 decoder — tries fractional seconds first, then plain.
-    private static let decoder: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let str = try container.decode(String.self)
-            let withMillis = ISO8601DateFormatter()
-            withMillis.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = withMillis.date(from: str) { return date }
-            let plain = ISO8601DateFormatter()
-            plain.formatOptions = [.withInternetDateTime]
-            if let date = plain.date(from: str) { return date }
-            throw DecodingError.dataCorruptedError(
-                in: container,
-                debugDescription: "Cannot parse date: \(str)"
-            )
-        }
-        return d
-    }()
+    private static let decoder: JSONDecoder = .iso8601Flexible
 
     private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -187,9 +169,8 @@ final class AnthropicAdminAPIReader {
         }
 
         var request = URLRequest(url: url)
+        request.timeoutInterval = 15
         request.httpMethod = "GET"
-        // Never log full key — mask it
-        print("[AnthropicAdminAPIReader] Using key \(key.prefix(8))...")
         request.setValue(key, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")

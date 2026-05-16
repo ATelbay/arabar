@@ -2,8 +2,7 @@ import Foundation
 
 enum PercentSource: String, Codable {
     case authoritative  // real utilization from provider's own API (cookies path)
-    case estimated      // computed from community-guessed PlanLimits.maxTokens
-    case unknown        // PlanLimits.maxTokens is nil; no meaningful percent possible
+    case unknown        // no limit data available; no meaningful percent possible
 }
 
 struct WindowSnapshot: Codable, Equatable {

@@ -1,16 +1,7 @@
 import Foundation
 
 final class Aggregator {
-    let claudePlan: PlanLimits.ClaudePlan
-    let chatgptPlan: PlanLimits.ChatGPTPlan
-
-    init(
-        claudePlan: PlanLimits.ClaudePlan = .pro,
-        chatgptPlan: PlanLimits.ChatGPTPlan = .plus
-    ) {
-        self.claudePlan = claudePlan
-        self.chatgptPlan = chatgptPlan
-    }
+    init() {}
 
     // MARK: - Main entry point
 
@@ -182,23 +173,6 @@ final class Aggregator {
         provider: Provider,
         durationHours: Int
     ) -> (Double?, PercentSource) {
-        let windows: [PlanLimits.Window]
-        switch provider {
-        case .claude:
-            windows = PlanLimits.claudeLimits(for: claudePlan)
-        case .codex:
-            windows = PlanLimits.chatgptLimits(for: chatgptPlan)
-        }
-
-        guard let window = windows.first(where: { $0.durationHours == durationHours }) else {
-            return (nil, .unknown)
-        }
-
-        guard let maxTokens = window.maxTokens else {
-            return (nil, .unknown)
-        }
-
-        let raw = Double(tokens) / Double(maxTokens)
-        return (max(0.0, min(1.0, raw)), .estimated)
+        return (nil, .unknown)
     }
 }

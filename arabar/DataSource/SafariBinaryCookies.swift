@@ -8,6 +8,22 @@ enum SafariCookiesError: Error {
     case invalidFormat(String)
 }
 
+enum SafariErrorCategory {
+    case fileNotFound
+    case accessDenied
+    case invalidFormat(String)
+}
+
+extension SafariCookiesError {
+    var category: SafariErrorCategory {
+        switch self {
+        case .fileNotFound:           return .fileNotFound
+        case .accessDenied:           return .accessDenied
+        case .invalidFormat(let msg): return .invalidFormat(msg)
+        }
+    }
+}
+
 struct SafariCookie {
     let domain: String
     let name: String
@@ -50,7 +66,7 @@ enum SafariBinaryCookies {
 
     // MARK: - Binary Parser
 
-    private static func parse(data: Data, matching hostMatches: [String]) throws -> [SafariCookie] {
+    static func parse(data: Data, matching hostMatches: [String]) throws -> [SafariCookie] {
         var offset = 0
 
         // Magic: "cook"
@@ -168,19 +184,19 @@ enum SafariBinaryCookies {
 
     // MARK: - Read helpers
 
-    private static func readUInt32BE(data: Data, offset: Int) -> UInt32 {
+    static func readUInt32BE(data: Data, offset: Int) -> UInt32 {
         let slice = data[offset..<(offset + 4)]
-        return slice.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        return slice.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian }
     }
 
-    private static func readUInt32LE(data: Data, offset: Int) -> UInt32 {
+    static func readUInt32LE(data: Data, offset: Int) -> UInt32 {
         let slice = data[offset..<(offset + 4)]
-        return slice.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        return slice.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
     }
 
-    private static func readFloat64LE(data: Data, offset: Int) -> Double {
+    static func readFloat64LE(data: Data, offset: Int) -> Double {
         let slice = data[offset..<(offset + 8)]
-        let bits = slice.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+        let bits = slice.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
         return Double(bitPattern: bits)
     }
 

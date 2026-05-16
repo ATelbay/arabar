@@ -1,4 +1,7 @@
 import Foundation
+import os.log
+
+private let claudeJsonlLog = OSLog(subsystem: "com.arystantelbay.arabar", category: "claude-jsonl")
 
 // MARK: - Raw JSONL structures
 
@@ -44,7 +47,8 @@ private struct CacheState: Codable {
 
 // MARK: - ClaudeUsageReader
 
-final class ClaudeUsageReader {
+// Single-owner serial access from AppViewModel — safe to treat as Sendable
+final class ClaudeUsageReader: @unchecked Sendable {
 
     // MARK: - Private state
 
@@ -53,26 +57,7 @@ final class ClaudeUsageReader {
     private let lookbackDays: Int
     private var cache: CacheState
 
-    // Decoder with millis-aware ISO8601
-    private static let decoder: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let str = try container.decode(String.self)
-            // Try with fractional seconds first, then without
-            let withMillis = ISO8601DateFormatter()
-            withMillis.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = withMillis.date(from: str) { return date }
-            let plain = ISO8601DateFormatter()
-            plain.formatOptions = [.withInternetDateTime]
-            if let date = plain.date(from: str) { return date }
-            throw DecodingError.dataCorruptedError(
-                in: container,
-                debugDescription: "Cannot parse date: \(str)"
-            )
-        }
-        return d
-    }()
+    private static let decoder: JSONDecoder = .iso8601Flexible
 
     // MARK: - Init
 
@@ -177,7 +162,7 @@ final class ClaudeUsageReader {
         }
 
         guard let handle = try? FileHandle(forReadingFrom: fileURL) else {
-            print("[ClaudeUsageReader] Cannot open \(fileURL.lastPathComponent)")
+            debugLog(claudeJsonlLog, "[ClaudeUsageReader] Cannot open \(fileURL.lastPathComponent)")
             return []
         }
         defer { try? handle.close() }
@@ -186,7 +171,7 @@ final class ClaudeUsageReader {
         do {
             try handle.seek(toOffset: fileState.byteOffset)
         } catch {
-            print("[ClaudeUsageReader] Seek failed for \(fileURL.lastPathComponent): \(error)")
+            debugLog(claudeJsonlLog, "[ClaudeUsageReader] Seek failed for \(fileURL.lastPathComponent): \(error)")
             return []
         }
 
@@ -256,7 +241,7 @@ final class ClaudeUsageReader {
             return try Self.decoder.decode(ClaudeRecord.self, from: lineData)
         } catch {
             if let str = String(data: lineData, encoding: .utf8) {
-                print("[ClaudeUsageReader] Parse error: \(error.localizedDescription) — line: \(str.prefix(120))")
+                debugLog(claudeJsonlLog, "[ClaudeUsageReader] Parse error: \(error.localizedDescription) — line: \(str.prefix(120))")
             }
             return nil
         }

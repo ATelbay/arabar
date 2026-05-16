@@ -1,7 +1,5 @@
 import Foundation
-import Security
 import SQLite3
-import CommonCrypto
 import os.log
 
 private let claudeLog = OSLog(subsystem: "com.arystantelbay.arabar", category: "cookies-claude")
@@ -106,12 +104,12 @@ final class ClaudeCookiesReader {
     private func mapSafariError<T>(_ body: () throws -> T) throws -> T {
         do {
             return try body()
-        } catch SafariCookiesError.fileNotFound {
-            throw ClaudeCookiesError.cookiesNotFound
-        } catch SafariCookiesError.accessDenied {
-            throw ClaudeCookiesError.accessDenied
-        } catch SafariCookiesError.invalidFormat(let msg) {
-            throw ClaudeCookiesError.parsingFailed(msg)
+        } catch let e as SafariCookiesError {
+            switch e.category {
+            case .fileNotFound:           throw ClaudeCookiesError.cookiesNotFound
+            case .accessDenied:           throw ClaudeCookiesError.accessDenied
+            case .invalidFormat(let msg): throw ClaudeCookiesError.parsingFailed(msg)
+            }
         }
     }
 
@@ -148,42 +146,19 @@ final class ClaudeCookiesReader {
 
     // MARK: - Cookie DB Paths (multi-profile)
 
-    /// Returns all existing Cookies DB paths under a Chromium User Data root.
-    private func profileCookiesPaths(underRoot root: String) -> [String] {
-        let fm = FileManager.default
-        var results: [String] = []
-        // "Default" always first, then "Profile N" in numeric order
-        let defaultPath = "\(root)/Default/Cookies"
-        if fm.fileExists(atPath: defaultPath) { results.append(defaultPath) }
-
-        guard let entries = try? fm.contentsOfDirectory(atPath: root) else { return results }
-        let profileDirs = entries
-            .filter { $0.hasPrefix("Profile ") && $0.dropFirst(8).allSatisfy(\.isNumber) }
-            .sorted { a, b in
-                let na = Int(a.dropFirst(8)) ?? 0
-                let nb = Int(b.dropFirst(8)) ?? 0
-                return na < nb
-            }
-        for dir in profileDirs {
-            let p = "\(root)/\(dir)/Cookies"
-            if fm.fileExists(atPath: p) { results.append(p) }
-        }
-        return results
-    }
-
     private func chromeCookiesPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Google/Chrome")
+        return ChromiumCookieDB.profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Google/Chrome")
     }
 
     private func braveCookiesPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return profileCookiesPaths(underRoot: "\(home)/Library/Application Support/BraveSoftware/Brave-Browser")
+        return ChromiumCookieDB.profileCookiesPaths(underRoot: "\(home)/Library/Application Support/BraveSoftware/Brave-Browser")
     }
 
     private func edgeCookiesPaths() -> [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Microsoft Edge")
+        return ChromiumCookieDB.profileCookiesPaths(underRoot: "\(home)/Library/Application Support/Microsoft Edge")
     }
 
     // MARK: - Multi-profile extraction
@@ -227,38 +202,41 @@ final class ClaudeCookiesReader {
             throw ClaudeCookiesError.cookiesNotFound
         }
 
-        // Copy DB to temp — Chrome may lock the file
-        let tmpPath = NSTemporaryDirectory() + "arabar_cookies_\(UUID().uuidString).db"
-        defer { try? FileManager.default.removeItem(atPath: tmpPath) }
+        let tmpURL: URL
         do {
-            try FileManager.default.copyItem(atPath: dbPath, toPath: tmpPath)
+            // Copy DB to temp — Chrome may lock the file
+            tmpURL = try {
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("arabar_\(UUID().uuidString).db")
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: dbPath), to: url)
+                return url
+            }()
         } catch {
             throw ClaudeCookiesError.cookiesNotFound
         }
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
 
         var db: OpaquePointer?
-        guard sqlite3_open_v2(tmpPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        guard sqlite3_open_v2(tmpURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
             throw ClaudeCookiesError.cookiesNotFound
         }
         defer { sqlite3_close(db) }
 
-        let dbVersion = readCookieDBVersion(db: db!)
+        let dbVersion = ChromiumCookieDB.readCookieDBVersion(db: db!)
         let hasHashPrefix = dbVersion >= 24
         debugLog(claudeLog, "DB meta version=\(dbVersion), hasHashPrefix=\(hasHashPrefix ? "YES" : "NO")")
 
-        let sql = """
-            SELECT name, value, encrypted_value
-            FROM cookies
-            WHERE host_key LIKE '%\(Self.claudeDomain)%'
-            AND name = '\(Self.sessionCookieName)'
-            LIMIT 1;
-            """
+        let sql = "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE ?1 AND name = ?2 LIMIT 1;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw ClaudeCookiesError.parsingFailed("SQLite prepare failed")
         }
         defer { sqlite3_finalize(stmt) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let likePattern = "%" + Self.claudeDomain + "%"
+        sqlite3_bind_text(stmt, 1, likePattern, -1, transient)
+        sqlite3_bind_text(stmt, 2, Self.sessionCookieName, -1, transient)
 
         var plainValue: String?
         var encryptedData: Data?
@@ -297,12 +275,17 @@ final class ClaudeCookiesReader {
         let prefix3 = String(data: encrypted.prefix(3), encoding: .utf8) ?? "??"
         debugLog(claudeLog, "cookie blob: \(encrypted.count) bytes, prefix=\(prefix3), profile=\(dbPath)")
 
-        let aesKeys = try chromeSafeStorageKey(service: safeStorageService, account: safeStorageAccount)
+        let passwordCandidates = ChromiumKeychain.readAllCandidateKeys(service: safeStorageService, account: safeStorageAccount)
+        guard !passwordCandidates.isEmpty else { throw ClaudeCookiesError.keychainAccessDenied }
+        let pwLens = passwordCandidates.map { $0.count }.map(String.init).joined(separator: ",")
+        debugLog(claudeLog, "password candidates: \(passwordCandidates.count), pwlens=[\(pwLens)]")
+        let aesKeys = passwordCandidates.compactMap { ChromiumKeychain.deriveAESKey(from: $0) }
         let keylens = aesKeys.map { $0.count }.map(String.init).joined(separator: ",")
         debugLog(claudeLog, "keychain candidates: \(aesKeys.count), keylens=[\(keylens)]")
+        guard !aesKeys.isEmpty else { throw ClaudeCookiesError.decryptionFailed }
         for (idx, key) in aesKeys.enumerated() {
             do {
-                let decrypted = try decryptChromeCookie(encrypted: encrypted, key: key, hasHashPrefix: hasHashPrefix)
+                let decrypted = try ChromiumCookieDB.decryptChromeCookieBlob(encrypted, key: key, hasHashPrefix: hasHashPrefix)
                 let head = String(decrypted.prefix(8))
                 let valid = decrypted.hasPrefix("sk-ant-")
                 debugLog(claudeLog, "key #\(idx) → decrypt OK, len=\(decrypted.count), head=\(head), valid=\(valid ? "YES" : "NO")")
@@ -312,184 +295,6 @@ final class ClaudeCookiesReader {
             }
         }
         throw ClaudeCookiesError.decryptionFailed
-    }
-
-    /// Reads the schema version from the Cookies DB meta table.
-    /// Chrome 130+ (DB version ≥ 24) prepends a 32-byte SHA256(host_key) to each cookie value before encryption.
-    private func readCookieDBVersion(db: OpaquePointer) -> Int {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = 'version'", -1, &stmt, nil) == SQLITE_OK else { return 0 }
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
-        if let raw = sqlite3_column_text(stmt, 0) {
-            return Int(String(cString: raw)) ?? 0
-        }
-        return 0
-    }
-
-    /// Reads all "Chrome Safe Storage" entries from the macOS Keychain and derives one AES-128 key per
-    /// non-empty password. Returns an array so callers can try each in turn.
-    private func chromeSafeStorageKey(service: String, account: String) throws -> [Data] {
-        // Gather all candidate password blobs — native API first, CLI fallback
-        var passwordCandidates: [Data] = []
-
-        if let nativeCandidates = try? readKeychainNativeAll(service: service, account: account),
-           !nativeCandidates.isEmpty {
-            passwordCandidates = nativeCandidates
-        } else if let cliData = try? readKeychainViaSecurityCLI(service: service, account: account) {
-            passwordCandidates = [cliData]
-        }
-
-        guard !passwordCandidates.isEmpty else {
-            throw ClaudeCookiesError.keychainAccessDenied
-        }
-
-        let pwLens = passwordCandidates.map { $0.count }.map(String.init).joined(separator: ",")
-        debugLog(claudeLog, "password candidates: \(passwordCandidates.count), pwlens=[\(pwLens)]")
-
-        // Derive a 16-byte AES key via PBKDF2-SHA1 for each candidate password
-        let salt = Data("saltysalt".utf8)
-        var keys: [Data] = []
-        for passwordData in passwordCandidates {
-            var derivedKey = Data(repeating: 0, count: 16)
-            let pbkdf2Status = derivedKey.withUnsafeMutableBytes { derivedBytes in
-                salt.withUnsafeBytes { saltBytes in
-                    passwordData.withUnsafeBytes { passwordBytes in
-                        CCKeyDerivationPBKDF(
-                            CCPBKDFAlgorithm(kCCPBKDF2),
-                            passwordBytes.baseAddress?.assumingMemoryBound(to: Int8.self),
-                            passwordData.count,
-                            saltBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                            salt.count,
-                            CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1),
-                            1003,
-                            derivedBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                            16
-                        )
-                    }
-                }
-            }
-            if pbkdf2Status == kCCSuccess {
-                keys.append(derivedKey)
-            }
-        }
-
-        guard !keys.isEmpty else { throw ClaudeCookiesError.decryptionFailed }
-        return keys
-    }
-
-    /// Enumerates ALL matching Keychain entries and returns their non-empty password Data values.
-    private func readKeychainNativeAll(service: String, account: String) throws -> [Data] {
-        // First — search by SERVICE only (no account filter) to see ALL entries with this service
-        let probeQuery: [String: Any] = [
-            kSecClass as String:           kSecClassGenericPassword,
-            kSecAttrService as String:     service,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String:      kSecMatchLimitAll
-        ]
-        var probeResult: CFTypeRef?
-        let probeStatus = SecItemCopyMatching(probeQuery as CFDictionary, &probeResult)
-        debugLog(claudeLog, "probe (service=\(service)): status=\(Int(probeStatus))")
-        if probeStatus == errSecSuccess, let attrs = probeResult as? [[String: Any]] {
-            for (i, dict) in attrs.enumerated() {
-                let acct = dict[kSecAttrAccount as String] as? String ?? "?"
-                let label = dict[kSecAttrLabel as String] as? String ?? "?"
-                let creator = (dict[kSecAttrCreator as String] as? Int).map { String(format: "0x%08x", $0) } ?? "?"
-                debugLog(claudeLog, "probe entry #\(i): acct=\(acct), label=\(label), creator=\(creator)")
-            }
-        } else if probeStatus == errSecSuccess, let single = probeResult as? [String: Any] {
-            let acct = single[kSecAttrAccount as String] as? String ?? "?"
-            let label = single[kSecAttrLabel as String] as? String ?? "?"
-            debugLog(claudeLog, "probe single entry: acct=\(acct), label=\(label)")
-        }
-
-        // Now actual data fetch (service + account filter)
-        let query: [String: Any] = [
-            kSecClass as String:        kSecClassGenericPassword,
-            kSecAttrService as String:  service,
-            kSecAttrAccount as String:  account,
-            kSecReturnData as String:   true,
-            kSecMatchLimit as String:   kSecMatchLimitAll
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else {
-            throw ClaudeCookiesError.keychainAccessDenied
-        }
-        if let array = result as? [Data] {
-            return array.filter { !$0.isEmpty }
-        }
-        if let single = result as? Data, !single.isEmpty {
-            return [single]
-        }
-        return []
-    }
-
-    private func readKeychainViaSecurityCLI(service: String, account: String) throws -> Data {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-w", "-s", service, "-a", account]
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw ClaudeCookiesError.keychainAccessDenied
-        }
-        let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let trimmed = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !trimmed.isEmpty else {
-            throw ClaudeCookiesError.keychainAccessDenied
-        }
-        return Data(trimmed.utf8)
-    }
-
-    /// Decrypts a Chromium-encrypted cookie blob.
-    /// Format: prefix "v10" (3 bytes) + AES-128-CBC ciphertext, IV = 16 space characters.
-    /// Chrome 130+ (DB schema version ≥ 24) prepends a 32-byte SHA256(host_key) to plaintext.
-    private func decryptChromeCookie(encrypted: Data, key: Data, hasHashPrefix: Bool) throws -> String {
-        let prefixLen = 3
-        guard encrypted.count > prefixLen else {
-            throw ClaudeCookiesError.decryptionFailed
-        }
-        let ciphertext = encrypted.dropFirst(prefixLen)
-        let iv = Data(repeating: 0x20, count: 16) // 16 space characters
-
-        let outputLen = ciphertext.count + kCCBlockSizeAES128
-        var decryptedBytes = [UInt8](repeating: 0, count: outputLen)
-        var numBytesDecrypted = 0
-
-        let ciphertextArray = [UInt8](ciphertext)
-        let keyArray = [UInt8](key)
-        let ivArray = [UInt8](iv)
-
-        let cryptStatus: CCCryptorStatus = CCCrypt(
-            CCOperation(kCCDecrypt),
-            CCAlgorithm(kCCAlgorithmAES128),
-            CCOptions(kCCOptionPKCS7Padding),
-            keyArray, keyArray.count,
-            ivArray,
-            ciphertextArray, ciphertextArray.count,
-            &decryptedBytes, outputLen,
-            &numBytesDecrypted
-        )
-
-        guard cryptStatus == kCCSuccess else {
-            debugLog(claudeLog, "CCCrypt FAILED: status=\(Int(cryptStatus)), ctlen=\(ciphertextArray.count), keylen=\(keyArray.count)")
-            throw ClaudeCookiesError.decryptionFailed
-        }
-        var decryptedData = Data(decryptedBytes.prefix(numBytesDecrypted))
-        if hasHashPrefix && decryptedData.count > 32 {
-            decryptedData = decryptedData.dropFirst(32)
-        }
-
-        guard let plaintext = String(data: decryptedData, encoding: .utf8) else {
-            debugLog(claudeLog, "UTF-8 decode FAILED (decrypted bytes are not valid UTF-8 → wrong AES key)")
-            throw ClaudeCookiesError.decryptionFailed
-        }
-        return plaintext
     }
 
     // MARK: - Claude API Calls
