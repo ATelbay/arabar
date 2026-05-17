@@ -39,6 +39,8 @@ add_key_if_missing() {
 add_key_if_missing "CFBundleExecutable"    "string" "arabar"
 add_key_if_missing "CFBundleIdentifier"    "string" "com.arystantelbay.arabar"
 add_key_if_missing "CFBundleName"          "string" "arabar"
+add_key_if_missing "CFBundleIconName"      "string" "AppIcon"
+add_key_if_missing "CFBundleIconFile"      "string" "AppIcon"
 add_key_if_missing "LSMinimumSystemVersion" "string" "14.0"
 add_key_if_missing "LSUIElement"           "bool"   "true"
 
@@ -80,6 +82,10 @@ if [ -d "arabar/Assets.xcassets" ]; then
     else
         echo "  WARNING: actool did not produce Assets.car in $ACTOOL_OUT_DIR"
         ls "$ACTOOL_OUT_DIR" || true
+    fi
+    if [ -f "$ACTOOL_OUT_DIR/AppIcon.icns" ]; then
+        cp "$ACTOOL_OUT_DIR/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
+        echo "  Placed AppIcon.icns in $CONTENTS/Resources/"
     fi
     # Clean up the raw xcassets from the SPM resource bundle (it's not used).
     if [ "$BUNDLE_COPIED" -eq 1 ]; then
