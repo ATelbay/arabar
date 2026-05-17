@@ -23,4 +23,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBarController = MenuBarController(viewModel: viewModel)
         lifecycle.attach(to: viewModel)
     }
+
+    // SwiftUI's Window scene defaults to quitting the app when the last window closes,
+    // even for LSUIElement menubar apps. Closing the Settings window must not terminate.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
+    }
 }
