@@ -479,11 +479,15 @@ final class OpenAICookiesReader {
             return WindowSnapshot(durationHours: fallbackHours, tokensUsed: 0, costUSD: 0, percentUsed: nil, resetAt: nil, percentSource: .unknown)
         }
         let hours = s.limitWindowSeconds > 0 ? s.limitWindowSeconds / 3600 : fallbackHours
+        // wham/usage reports used_percent as an integer with a floor of 1 — any nonzero
+        // activity (including the rolling 7d window catching old sessions) shows as 1%,
+        // which makes idle users see "99% left". Subtract 1 so the floor reads as 100%.
+        let adjustedUsedPercent = max(0, s.usedPercent - 1)
         return WindowSnapshot(
             durationHours: hours,
             tokensUsed: 0,
             costUSD: 0,
-            percentUsed: Double(s.usedPercent) / 100.0,
+            percentUsed: Double(adjustedUsedPercent) / 100.0,
             resetAt: Date(timeIntervalSince1970: TimeInterval(s.resetAt)),
             percentSource: .authoritative
         )

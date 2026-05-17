@@ -276,7 +276,7 @@ struct MenuContentView: View {
                 Button("Quit") {
                     NSApplication.shared.terminate(nil)
                 }
-                .keyboardShortcut("q")
+                .keyboardShortcut("q", modifiers: .command)
 
                 Spacer()
             }
