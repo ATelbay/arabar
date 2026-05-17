@@ -24,23 +24,23 @@ open /Applications/arabar.app
 
 ## Что показывает
 
-В menubar: иконка провайдера + процент использования. Два провайдера чередуются каждые 20 секунд. Если данных нет — `arabar`.
+В menubar: иконка провайдера + процент **оставшегося** лимита 5-часового окна. Два провайдера (Claude / ChatGPT) чередуются каждые 30 секунд; правый клик / two-finger tap по иконке переключает вручную. Если для активного провайдера нет авторитетного источника (cookies не настроены / 401) — рядом с иконкой `ukwn`.
 
-- **Subscription** (Pro/Max/Plus): процент использованного лимита окна. Claude и ChatGPT имеют разные окна (5h / 7d).
+- **Subscription** (Pro/Max/Plus): процент **оставшегося** лимита 5h-окна и 7d-окна. Дропдаун показывает оба окна с прогресс-баром, который тоже инвертирован (бар сжимается по мере расхода).
 - **API tier**: расход pay-as-you-go запросов (отдельный счёт, не пересекается с subscription).
-- Цвет процента: `<70%` — обычный, `70–90%` — оранжевый, `>90%` — красный.
+- Цвет процента: `>30%` осталось — обычный/акцентный, `10–30%` — оранжевый, `<10%` — красный.
 - Стоимость в USD и время до сброса окна — в дропдауне.
-- Статус провайдера (incidents через status.anthropic.com / status.openai.com).
+- Статус провайдера (incidents через status.anthropic.com / status.openai.com) — оранжевый треугольник рядом с процентом, когда не `operational`.
 
 ## Источники данных
 
 | Источник | Что даёт | Как включить |
 |---|---|---|
-| **CLI JSONL** | Subscription-tier usage из Claude Code / Codex CLI | Работает автоматически если CLI установлен (`~/.claude/projects/`, `~/.codex/sessions/`) |
-| **Browser cookies** | Subscription usage напрямую из claude.ai / chatgpt.com | Opt-in в Settings → таб Claude/ChatGPT → "Use browser session cookies" |
+| **CLI JSONL** | Реальные токены и стоимость из Claude Code / Codex CLI (процент — только если есть cookies) | Работает автоматически если CLI установлен (`~/.claude/projects/`, `~/.codex/sessions/`) |
+| **Browser cookies** | Авторитетный процент оставшегося лимита из claude.ai / chatgpt.com | Opt-in в Settings → таб Claude/ChatGPT → "Use browser session cookies" |
 | **Admin API key** | API-tier usage (pay-as-you-go, отдельный счёт) | Opt-in в Settings → таб Claude/ChatGPT → поле "Admin API key" |
 
-Источники subscription не смешиваются (риск двойного счёта): приоритет cookies → JSONL.
+Subscription-источники **объединяются**: cookies дают авторитетный процент и время сброса, JSONL — реальные токены и стоимость. Если cookies недоступны — показывается только то, что есть из JSONL, а процент превращается в `ukwn`. API tier живёт отдельным разделом дропдауна.
 
 ## Настройки
 
@@ -57,11 +57,11 @@ open /Applications/arabar.app
 
 Включается в Settings → нужный таб → "Use browser session cookies". По умолчанию выключено.
 
-Поддержанные браузеры: **Chrome, Brave, Edge** (Chromium-семейство). Safari — в планах.
+Поддержанные браузеры: **Safari, Chrome, Brave, Edge**. У Chromium-семейства cookies лежат в SQLite + AES-зашифрованы Keychain-ключом "Chrome Safe Storage" (Chrome 130+ префиксует value SHA256-хэшем — мы это учитываем); у Safari — бинарный `~/Library/Cookies/Cookies.binarycookies`.
 
 Cookies используются только для запросов к `claude.ai` и `chatgpt.com` с вашего устройства — никуда не передаются, маскируются в логах приложения.
 
-macOS покажет системный диалог разрешения доступа к Keychain (Chrome Safe Storage) — это ожидаемо при первом включении.
+При первом подключении к Chromium-браузеру macOS попросит разрешить доступ к Keychain item "Chrome Safe Storage" (это нужно, чтобы расшифровать cookies). Для Safari при первом чтении может потребоваться **Full Disk Access** в System Settings → Privacy & Security (Safari cookies защищены TCC).
 
 Enable cookies-reader debug logs: `defaults write com.arystantelbay.arabar debug.cookies -bool true` (then restart arabar; view in Console.app filtered by subsystem `com.arystantelbay.arabar`).
 

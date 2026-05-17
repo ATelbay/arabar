@@ -33,31 +33,48 @@
 
 ## Архитектура
 
+Swift Package (Package.swift), не xcodeproj. Build через `./scripts/build_app.sh release` (под капотом: `swift build -c release` + ручная сборка `.app`-бандла + `xcrun actool` для Asset Catalog + ad-hoc `codesign`).
+
 ```
 arabar/
-├── arabar.xcodeproj
+├── Package.swift, scripts/build_app.sh, Tests/arabarTests/
 └── arabar/
     ├── App/
-    │   └── ArabarApp.swift              # @main, MenuBarExtra
+    │   ├── ArabarApp.swift              # @main, AppDelegate (NSStatusItem, не MenuBarExtra)
+    │   └── AppViewModel.swift           # @StateObject, refresh(), rotation timer
     ├── DataSource/
-    │   ├── ClaudeUsageReader.swift
-    │   ├── CodexUsageReader.swift
-    │   └── JSONLStreamParser.swift      # общий стрим-парсер с offset-кэшем
+    │   ├── ClaudeUsageReader.swift      # JSONL ~/.claude/projects/, инкрементальный
+    │   ├── CodexUsageReader.swift       # JSONL ~/.codex/sessions/, инкрементальный
+    │   ├── CodexAuth.swift              # читает ~/.codex/auth.json
+    │   ├── ClaudeCookiesReader.swift    # claude.ai/api/organizations/{id}/usage
+    │   ├── OpenAICookiesReader.swift    # chatgpt.com/backend-api/wham/usage (2-step Bearer)
+    │   ├── AnthropicAdminAPIReader.swift # api.anthropic.com/v1/organizations/usage_report
+    │   ├── OpenAIUsageAPIReader.swift   # api.openai.com/v1/organization/usage/completions
+    │   ├── SafariBinaryCookies.swift    # парсер Apple BinaryCookies формата
+    │   ├── ChromiumKeychain.swift       # унифицированный Keychain access для Chrome/Brave/Edge
+    │   ├── ChromiumCookieDB.swift       # SQLite reader + Chrome 130+ hash-prefix strip
+    │   └── CookieExpiry.swift           # unified provider→Date? для UI warnings
     ├── Model/
-    │   ├── UsageEvent.swift             # {timestamp, model, inTokens, outTokens, cacheTokens}
-    │   ├── UsageSnapshot.swift          # {windowPct, weekPct, resetAt, cost}
-    │   └── Provider.swift               # enum
+    │   ├── UsageEvent.swift             # token deltas от одной message/turn
+    │   ├── UsageSnapshot.swift          # WindowSnapshot{durationHours, pct, source, resetAt, tokens, cost}
+    │   ├── Provider.swift               # enum .claude, .codex
+    │   └── StatusInfo.swift             # incident-level от Statuspage
     ├── Logic/
-    │   ├── Aggregator.swift             # 5h окно + неделя, считает %
-    │   ├── Pricing.swift                # таблицы стоимости моделей
-    │   └── PlanLimits.swift             # лимиты Pro/Max планов
+    │   ├── Aggregator.swift             # дедуп + per-window suм + cost; percentUsed возвращает (nil, .unknown)
+    │   └── Pricing.swift                # таблицы $/MTok per model (актуализированы 2026-05-16)
     ├── UI/
-    │   ├── MenuBarLabel.swift           # компактный текст с %
-    │   └── MenuContentView.swift        # дропдаун: бары, цифры, refresh
+    │   ├── MenuBarController.swift      # NSStatusItem, NSPopover, left/right-click handling
+    │   ├── MenuBarLabel.swift           # SwiftUI label inside hosting view, реагирует на rotationIndex
+    │   ├── MenuContentView.swift        # popover dropdown
+    │   └── SettingsView.swift           # TabView Claude/ChatGPT/About, ProviderSettingsTab
     └── Infra/
-        ├── Scheduler.swift              # Timer refresh
-        ├── KeychainStore.swift          # наш собственный Keychain entry
-        └── StatusPagePoller.swift
+        ├── Scheduler.swift              # 60s Timer auto-refresh
+        ├── AppLifecycle.swift           # attach scheduler к viewModel
+        ├── KeychainStore.swift          # com.arystantelbay.arabar.adminkey.{anthropic,openai}
+        ├── LoginItemController.swift    # SMAppService.mainApp
+        ├── StatusPagePoller.swift       # status.anthropic.com / status.openai.com
+        ├── SharedDecoders.swift         # iso8601Flexible JSONDecoder extension
+        └── DebugLog.swift               # debugLog(_:type:_:) gated by UserDefaults debug.cookies
 ```
 
 ---
@@ -122,10 +139,7 @@ arabar/
   - Хранение в `UserDefaults`. Кнопка "Test connection".
   - Открывается как отдельное `Window`/`Settings` scene (не Sheet — MenuBarExtra закрывается при потере фокуса).
 
-- [ ] **T13. AppViewModel fallback chain.** → правлю сам (small change, dispatcher logic).
-  - Источники в порядке приоритета per-provider: cookies (если opt-in и работают) → JSONL (если CLI установлен) → пусто.
-  - Не объединять данные (риск двойного счёта) — берём один источник.
-  - При смене источника очищать event buffer (старые JSONL-события не смешивать с cookies-данными).
+- [x] **T13. AppViewModel fallback chain.** Закрыто в Группе C вместе с T19 (см. log 2026-05-16). Эволюционировало: вместо exclusive priority cookies → JSONL → пусто, теперь cookies+JSONL **мерджатся** (`mergedSnapshot`/`mergedWindow` в `AppViewModel`): cookies дают авторитетный `percentUsed`/`resetAt`, JSONL — реальные `tokensUsed`/`costUSD`. Без cookies — только JSONL (процент `unknown`).
 
 - [x] **T14. UI Rotation + SVG icons.** `arabar/UI/MenuBarLabel.swift` переписан. Создано: `Assets.xcassets/AnthropicLogo.imageset/{anthropic.svg, Contents.json}` + `OpenAILogo.imageset/{openai.svg, Contents.json}` с `template-rendering-intent: template`. Ротация: `Timer.publish(every: 20)` + `@State currentIndex`. Если у активного провайдера нет данных (`percentUsed == nil`) → автоматически skip на следующего. Если оба пусты → `Text("arabar")`. Layout: иконка 12pt template + процент в monospaced 12pt с цветовой шкалой. `.id(provider)` для transition между провайдерами.
   - Положить SVG лого в `arabar/Assets.xcassets/AnthropicLogo.imageset/` и `OpenAILogo.imageset/`. SVG-данные:
@@ -138,10 +152,7 @@ arabar/
   - Layout: `Image("AnthropicLogo")` или `Image("OpenAILogo")` (с `.renderingMode(.template)`, размер ~12pt) + `Text("XX%")` с цветовой шкалой.
   - Опционально: `.transition(.opacity)` между провайдерами.
 
-- [ ] **T15. README + STATUS.md.** → правлю сам.
-  - Документировать opt-in cookies подход и почему он нужен (нет user-usage API у Anthropic/OpenAI).
-  - Объяснить какие cookies читаются и куда улетают (никуда — только claude.ai / chatgpt.com).
-  - Записать в лог.
+- [x] **T15. README + STATUS.md.** Закрыто 2026-05-16 (cookies opt-in задокументирован) и повторно проактуализировано 2026-05-17 (rotation 30s, %-left семантика, цветовая шкала, Safari support, architecture section, открытые вопросы).
 
 ### Дополнительные задачи — API-tier usage (opt-in)
 
@@ -164,11 +175,7 @@ arabar/
   - Ключи в Keychain, не в UserDefaults (sensitive credentials).
   - **Безопасность**: никогда не логировать ключ; в UI скрытое поле; в Test connection — таймаут 5 сек.
 
-- [ ] **T19. AppViewModel multi-source dispatch.** Расширение T13. → правлю сам.
-  - Per-provider у пользователя теперь до 3 потенциальных источников: **subscription** (cookies или CLI JSONL), **API** (Admin key). Это разные счета — не смешивать в одном snapshot.
-  - В Settings — radio "Primary display source": subscription / api. Это определяет что показывается в menubar.
-  - В дропдауне `MenuContentView` — отдельные секции если оба включены: "Claude Subscription" + "Claude API". Каждая со своим прогресс-баром.
-  - `UsageSnapshot` расширить полем `sourceKind: enum { subscription, api }` (или добавить параллельный snapshot для API).
+- [x] **T19. AppViewModel multi-source dispatch.** Закрыто 2026-05-16 в Группе C. Реализация: 4 параллельных `@Published` snapshot'а в `AppViewModel` (`claudeSnapshot`, `codexSnapshot`, `claudeApiSnapshot`, `codexApiSnapshot`); display picker `display.source.{claude,openai}` ∈ {`subscription`, `api`} в Settings override-ит primary; `MenuContentView` рендерит secondary "Claude API"/"OpenAI API" секцию если API snapshot есть и отличается от primary. Без расширения `UsageSnapshot` — параллельные snapshot'ы оказались чище.
 
 ### Параллелизация
 
@@ -388,9 +395,10 @@ struct UsageEvent {
 
 ## Открытые вопросы
 
-- Точные численные лимиты Claude Code Pro/Max — пока неизвестны, нужен T2.
-- Какой план у пользователя — определит % шкалу. Возможно, сделаем авто-калибровку по наблюдаемому максимуму за 30 дней.
-- Нужны ли красивые иконки в Asset Catalog или достаточно SF Symbols.
+Все исходные вопросы (точные лимиты Pro/Max, авто-калибровка %, SVG vs SF Symbols) сняты:
+
+- **Лимиты Pro/Max не нужны**: `PlanLimits.swift` удалён в review pass (W2), процент берём напрямую из cookies-endpoint'ов (`utilization` от Anthropic, `used_percent` от OpenAI) — это и есть авторитетная цифра от провайдера.
+- **Иконки**: SVG в `Assets.xcassets` (AnthropicLogo + OpenAILogo, simple-icons CC0), template-rendered, ресайз через NSImage drawing block. SF Symbols только как фолбэк для status-индикаторов (warning triangle).
 
 ---
 
@@ -473,6 +481,13 @@ struct UsageEvent {
   - **Right-click переключение провайдера (новая фича)**: пользователь захотел чтобы ПКМ / two-finger tap по иконке менял провайдера. `MenuBarExtra` не различает кнопки мыши → миграция на AppKit `NSStatusItem` + `NSPopover` через новый `MenuBarController.swift`. `ArabarApp.swift` теперь через `@NSApplicationDelegateAdaptor(AppDelegate.self)`, AppDelegate владеет `viewModel`/`lifecycle`/`menuBarController`. Settings scene осталась SwiftUI `Window`. `button.sendAction(on: [.leftMouseUp, .rightMouseUp])` + проверка `NSApp.currentEvent?.type` → left-click открывает popover, right-click инкрементит `rotationIndex`. После первой установки проценты пропали (auto-layout problem) — `NSHostingView` пинился только leading/trailing/centerY + 4pt insets, ширина status item не догнала intrinsic ширину SwiftUI → KVO на `fittingSize` + явное `statusItem.length = max(fittingSize.width, 24)` всё починило.
   - **Git/GitHub**: 27 файлов, +1114 / -1039. Pushed `f53b466` в `main` (force, после удаления искусственного empty baseline от `/ultrareview`-обхода). Branch `review` удалён локально+remote. Default branch на GitHub теперь содержит весь код: https://github.com/ATelbay/arabar
   - Final state: **30 production + 5 test .swift файлов** (35 total), 23/23 тестов pass, `Build complete!` чисто, `/Applications/arabar.app` 1.5M ad-hoc подписан.
+
+- **2026-05-17** — Короткая follow-up сессия. 3 коммита прямо в `main` (явное разрешение пользователя), один self-revert.
+  - **`3536bad` — ChatGPT 99% floor + explicit ⌘Q.** В `OpenAICookiesReader.window(from:fallbackHours:)` теперь `max(0, s.usedPercent - 1)`. Причина: endpoint `/backend-api/wham/usage` отдаёт `used_percent` как `Int` с минимумом 1 — любое использование (включая 7d rolling window, ловящий давние сессии) показывалось как «99% left», даже когда юзер не работал. Применено к обоим окнам (primary 5h + secondary 168h). Цена: −1% точности в нижней части шкалы, незаметно. Параллельно `keyboardShortcut("q")` → `keyboardShortcut("q", modifiers: .command)` — поведение не меняется (`.command` — дефолтный modifier у SwiftUI), но запись однозначнее (был момент лже-диагноза с моей стороны).
+  - **`3dce25d` — Option-gated Quit (отменён `ce15542`).** Юзерский процесс arabar два раза подряд завершался без видимых действий (16-05 20:41, 17-05 14:43). В обоих случаях лог идентичен: `trackMouse send action on mouseUp → sendAction: → terminate:`, без крэшей и без SIGTERM. Заметил в логе **бурст из 12 sendAction за 10 секунд** перед final terminate, ложно предположил accessibility-эмулированный ввод / фантомные клики. Закатал `OptionKeyMonitor` (`ObservableObject` поверх `NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged])`), кнопку Quit спрятал за зажатый Option, рядом подсказку `⌥ to quit`.
+  - **`ce15542` — корневой фикс + revert Option-gate.** Юзер нашёл реальную причину: красный крестик на окне Settings закрывал ВСЁ приложение. SwiftUI `Window` scene по дефолту вызывает `applicationShouldTerminateAfterLastWindowClosed = YES`, что для `LSUIElement` menubar-app некорректно. Это и был источник «12 sendAction за 10 секунд» — юзер кликал по табам / SecureField / тогглам в Settings, потом по X. Фикс в `AppDelegate`: переопределение `applicationShouldTerminateAfterLastWindowClosed → false`. Option-gate откатан как лечение симптома (3 строки в `AppDelegate` дешевле, чем `NSEvent`-мониторинг + условный рендер кнопки).
+  - **Документация**: README выровнен с фактическим кодом — rotation 20→30s, %-семантика «осталось», цветовая шкала >30/10–30/<10, явное упоминание merge cookies + JSONL (cookies для %, JSONL для tokens/cost), `ukwn` вместо placeholder `arabar`.
+  - **Build**: 30 production + 5 test файлов, без новых файлов / без правок `Package.swift` / без новых тестов. Все правки в существующих `OpenAICookiesReader.swift`, `MenuContentView.swift`, `ArabarApp.swift`. Чистая release-сборка, ad-hoc подписана, установлена в `/Applications/arabar.app`.
 
 ### Закрыто из бэклога
 
