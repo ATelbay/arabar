@@ -1,8 +1,10 @@
 import SwiftUI
+import AppKit
 
 struct MenuContentView: View {
     @ObservedObject var viewModel: AppViewModel
     @StateObject private var loginItem = LoginItemController()
+    @StateObject private var optionKey = OptionKeyMonitor()
     @Environment(\.openWindow) private var openWindow
 
     private let relativeFmt: RelativeDateTimeFormatter = {
@@ -273,10 +275,17 @@ struct MenuContentView: View {
                 }
                 .keyboardShortcut(",")
 
-                Button("Quit") {
-                    NSApplication.shared.terminate(nil)
+                if optionKey.isHeld {
+                    Button("Quit") {
+                        NSApplication.shared.terminate(nil)
+                    }
+                    .keyboardShortcut("q", modifiers: .command)
+                } else {
+                    Text("⌥ to quit")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .help("Hold the Option key to reveal the Quit button.")
                 }
-                .keyboardShortcut("q", modifiers: .command)
 
                 Spacer()
             }
@@ -335,5 +344,27 @@ struct MenuContentView: View {
         } else {
             return "in \(max(minutes, 0))m"
         }
+    }
+}
+
+// Tracks whether the Option (⌥) modifier is currently held. Used to gate the Quit
+// button — accessibility-emulated or stray mouseUp events have been observed
+// targeting the menubar popover and triggering NSApp.terminate; requiring Option
+// blocks any single phantom click from quitting the app.
+@MainActor
+final class OptionKeyMonitor: ObservableObject {
+    @Published var isHeld: Bool = NSEvent.modifierFlags.contains(.option)
+    private var monitor: Any?
+
+    init() {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged]) { [weak self] event in
+            let held = event.modifierFlags.contains(.option)
+            Task { @MainActor in self?.isHeld = held }
+            return event
+        }
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
     }
 }
