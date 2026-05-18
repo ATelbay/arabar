@@ -30,7 +30,7 @@ open /Applications/arabar.app
 - **API tier**: расход pay-as-you-go запросов (отдельный счёт, не пересекается с subscription).
 - Цвет процента: `>30%` осталось — обычный/акцентный, `10–30%` — оранжевый, `<10%` — красный.
 - Стоимость в USD и время до сброса окна — в дропдауне.
-- Статус провайдера (incidents через status.anthropic.com / status.openai.com) — оранжевый треугольник рядом с процентом, когда не `operational`.
+- Статус провайдера (incidents через status.anthropic.com / status.openai.com): в menubar треугольник показывается только для серьёзных outage (`partialOutage`/`majorOutage`), чтобы minor degraded не вытеснял процент; в дропдауне minor degraded всё ещё отображается текстом.
 
 ## Источники данных
 
@@ -40,7 +40,7 @@ open /Applications/arabar.app
 | **Browser cookies** | Авторитетный процент оставшегося лимита из claude.ai / chatgpt.com | Opt-in в Settings → таб Claude/ChatGPT → "Use browser session cookies" |
 | **Admin API key** | API-tier usage (pay-as-you-go, отдельный счёт) | Opt-in в Settings → таб Claude/ChatGPT → поле "Admin API key" |
 
-Subscription-источники **объединяются**: cookies дают авторитетный процент и время сброса, JSONL — реальные токены и стоимость. Если cookies недоступны — показывается только то, что есть из JSONL, а процент превращается в `ukwn`. API tier живёт отдельным разделом дропдауна.
+Subscription-источники **объединяются**: cookies дают авторитетный процент и время сброса, JSONL — реальные токены и стоимость. Если cookies недоступны — показывается только то, что есть из JSONL, а процент превращается в `ukwn`. Авторитетные snapshots имеют freshness TTL: fresh ≤2 минуты, stale 2–30 минут, expired >30 минут или после `resetAt`; expired проценты suppress-ятся в `ukwn`, но JSONL токены/стоимость остаются видимыми. API tier живёт отдельным разделом дропдауна.
 
 ## Настройки
 

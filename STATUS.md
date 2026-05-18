@@ -1,6 +1,6 @@
 # arabar — статус проекта
 
-Менюбар-приложение для macOS, показывает **проценты оставшегося лимита** Claude Code и ChatGPT/Codex прямо в статусной строке. Подобие [CodexBar](https://github.com/steipete/CodexBar). Три источника данных (opt-in): локальные CLI JSONL, cookies браузера (Chrome/Brave/Edge), Admin API key для API-tier usage.
+Менюбар-приложение для macOS, показывает **проценты оставшегося лимита** Claude Code и ChatGPT/Codex прямо в статусной строке. Подобие [CodexBar](https://github.com/steipete/CodexBar). Три источника данных: локальные CLI JSONL, browser cookies (opt-in; Safari/Chrome/Brave/Edge), Admin API key для API-tier usage (opt-in).
 
 ---
 
@@ -10,20 +10,21 @@
 |---|---|---|
 | Стек | Swift + SwiftUI + AppKit `NSStatusItem` + `NSPopover` | Нативный, маленький бинарь, macOS 14+. С 2026-05-16 ушли с `MenuBarExtra` ради поддержки правого клика. |
 | Поддерживаемые провайдеры (MVP) | Claude Code + ChatGPT/Codex | По запросу пользователя |
-| Отображение в menubar | **Текст с процентами**, напр. `C 67% • G 42%` | Пользователь хочет проценты видеть сразу, без раскрытия меню |
-| Доступ к credentials | Только локальные JSONL + опционально Keychain нашего приложения | Пользователь против запроса доступа к cookies Chrome/Safari |
+| Отображение в menubar | Иконка активного провайдера + `% left` 5h-окна; Claude/ChatGPT ротируются каждые 30s, right-click переключает вручную | Экономим место в status bar, но процент виден без раскрытия меню |
+| Доступ к credentials | CLI JSONL без credentials; cookies только opt-in; Admin API keys в Keychain нашего приложения | Минимум прав по умолчанию, sensitive данные локально |
 | Окна лимитов | 5-часовое скользящее + недельное | Как у Anthropic/OpenAI |
 
 ## Источники данных
 
 **Claude Code:**
-- `~/.claude/projects/**/*.jsonl` — последние 30 дней, инкрементальный парсинг
-- Опционально: OAuth токен в нашей записи Keychain (для прямых запросов к API)
+- `~/.claude/projects/**/*.jsonl` — локальные токены/стоимость, инкрементальный парсинг + 192h event buffer
+- Browser cookies (Safari/Chrome/Brave/Edge, opt-in) → `claude.ai/api/organizations/{id}/usage`, авторитетные `% left` и `resetAt`
+- Admin API key (opt-in, Keychain) → API-tier usage через `api.anthropic.com/v1/organizations/usage_report/messages`
 
 **ChatGPT/Codex:**
-- `~/.codex/sessions/**/*.jsonl` + `~/.codex/archived_sessions/`
-- `~/.codex/auth.json` — уже существует у пользователя, читаем напрямую
-- Опционально: `codex app-server` JSON-RPC (`account/read`, `account/rateLimits/read`)
+- `~/.codex/sessions/**/*.jsonl` + `~/.codex/archived_sessions/` — локальные токены/стоимость
+- Browser cookies (Safari/Chrome/Brave/Edge, opt-in) → `/api/auth/session` → Bearer → `chatgpt.com/backend-api/wham/usage`, авторитетные `% left` и `resetAt`
+- Admin API key (opt-in, Keychain) → API-tier usage через `api.openai.com/v1/organization/usage/completions`
 
 **Статус провайдеров (опционально):**
 - `https://status.anthropic.com/api/v2/status.json`
@@ -57,10 +58,11 @@ arabar/
     ├── Model/
     │   ├── UsageEvent.swift             # token deltas от одной message/turn
     │   ├── UsageSnapshot.swift          # WindowSnapshot{durationHours, pct, source, resetAt, tokens, cost}
+    │   ├── SnapshotFreshness.swift      # fresh/stale/expired TTL для authoritative snapshots
     │   ├── Provider.swift               # enum .claude, .codex
     │   └── StatusInfo.swift             # incident-level от Statuspage
     ├── Logic/
-    │   ├── Aggregator.swift             # дедуп + per-window suм + cost; percentUsed возвращает (nil, .unknown)
+    │   ├── Aggregator.swift             # дедуп + per-window sum + cost; локальные источники дают percentSource .unknown
     │   └── Pricing.swift                # таблицы $/MTok per model (актуализированы 2026-05-16)
     ├── UI/
     │   ├── MenuBarController.swift      # NSStatusItem, NSPopover, left/right-click handling
@@ -79,7 +81,9 @@ arabar/
 
 ---
 
-## Задачи (для разбивки по agent teammates)
+## Задачи / исторический лог реализации
+
+Ниже сохранён исторический план и заметки по этапам; актуальный срез проекта — в разделах выше и в "Закрыто из бэклога".
 
 Легенда: `[ ]` todo · `[~]` in progress · `[x]` done.
 `→` — рекомендуемый тип агента (`Explore`/`general-purpose`/`Plan`).
@@ -116,7 +120,7 @@ arabar/
 
 ---
 
-## Фаза 5 — Browser Cookies + UI Rotation (план, не запущен)
+## Фаза 5 — Browser Cookies + UI Rotation (закрыто; исторический план ниже)
 
 **Контекст**: MVP читает только локальные JSONL Claude Code / Codex CLI. Если CLI не установлен — приложение пустое. Пользователь не хочет такой зависимости. Anthropic/OpenAI не публикуют user-usage API для подписок Pro/Max/Plus — единственный путь без CLI это cookies браузера для приватных endpoints `claude.ai` и `chatgpt.com` (как делает CodexBar).
 
@@ -124,13 +128,13 @@ arabar/
 
 ### Задачи
 
-- [x] **T10. Claude cookies reader.** `arabar/DataSource/ClaudeCookiesReader.swift` (427 строк). Поддержаны Chromium-семейство: **Chrome, Brave, Edge** (общий код через SQLite + Chrome Safe Storage Keychain). Safari = `throw .browserUnsupported` (200+ строк бинарного парсера BinaryCookies, отложено). Endpoint **взят прямо из исходников CodexBar**: `GET claude.ai/api/organizations` → orgId, `GET claude.ai/api/organizations/{orgId}/usage` → `five_hour.utilization` + `seven_day.utilization` (проценты 0-100) + `resets_at`. Cookie name: `sessionKey=sk-ant-...`. Маппинг: percentUsed = utilization/100, tokensUsed = 0 (API возвращает только проценты). Chrome AES-128-CBC: PBKDF2-SHA1 (salt "saltysalt", 1003 итерации, IV = 16 пробелов), DB копируется во временный файл (Chrome может локать).
+- [x] **T10. Claude cookies reader.** `arabar/DataSource/ClaudeCookiesReader.swift`. Поддержаны **Safari, Chrome, Brave, Edge**. Safari читает `~/Library/Cookies/Cookies.binarycookies`; Chromium-семейство — SQLite cookies DB + Safe Storage Keychain, включая Chrome 130+ SHA256 host hash prefix. Endpoint: `GET claude.ai/api/organizations` → orgId, `GET claude.ai/api/organizations/{orgId}/usage` → `five_hour.utilization` + `seven_day.utilization` (0–100, включая authoritative `0`) + `resets_at`. Cookie name: `sessionKey=sk-ant-...`.
   - Извлечь session cookie для домена `claude.ai` из Safari (`~/Library/Cookies/Cookies.binarycookies`), Chrome (`~/Library/Application Support/Google/Chrome/*/Cookies` — SQLite + расшифровка через Keychain item "Chrome Safe Storage"), Brave, Edge.
   - Дёрнуть приватный endpoint claude.ai (точный путь reverse-engineer через CodexBar исходники + DevTools на claude.ai). Распарсить usage.
   - Вернуть `[UsageEvent]` или `UsageSnapshot` напрямую (зависит от формата API).
   - Опт-ин флаг: читать только если `UserDefaults.bool(forKey: "cookies.enabled.claude")` == true.
 
-- [x] **T11. OpenAI cookies reader.** `arabar/DataSource/OpenAICookiesReader.swift`. Поддержаны **Chrome, Brave, Edge** (тот же путь что T10). Safari TODO. Endpoint: `chatgpt.com/backend-api/conversation/limits` (returns `message_cap_user`, `message_cap_window`, `reset_at`); fallback `chatgpt.com/api/auth/session` для проверки cookie. **Важно**: ChatGPT subscription лимит измеряется в **сообщениях**, не токенах — кладём в `tokensUsed` с комментарием `// counts messages, not tokens`. Класс `OpenAIBrowserSource` отдельный от Claude reader (TODO: вынести общий `BrowserSource` enum).
+- [x] **T11. OpenAI cookies reader.** `arabar/DataSource/OpenAICookiesReader.swift`. Поддержаны **Safari, Chrome, Brave, Edge**. Текущий flow: browser cookies → `chatgpt.com/api/auth/session` → accessToken/account id → `chatgpt.com/backend-api/wham/usage` с Bearer. Возвращает authoritative primary/secondary windows (`used_percent`, `reset_at`, `limit_window_seconds`). `used_percent` floor 1 корректируется до 0 для idle lower bound.
   - Симметрично для `chatgpt.com`, endpoint `chatgpt.com/codex/settings/usage` (или актуальный — проверить по CodexBar).
   - Те же 4 браузера, та же логика opt-in флага.
 

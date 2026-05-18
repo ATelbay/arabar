@@ -46,6 +46,9 @@ final class AppViewModel: ObservableObject {
     // Sticky-snapshot invalidation: track last-known cookies-enabled state
     private var lastClaudeCookiesEnabled: Bool
     private var lastOpenAICookiesEnabled: Bool
+    private var lastClaudeCookieSource: String
+    private var lastOpenAICookieSource: String
+    private var settingsRevision: Int = 0
     private var cancellables: Set<AnyCancellable> = []
 
     private let bufferFile: URL = {
@@ -64,6 +67,8 @@ final class AppViewModel: ObservableObject {
     init() {
         lastClaudeCookiesEnabled = UserDefaults.standard.bool(forKey: "cookies.enabled.claude")
         lastOpenAICookiesEnabled = UserDefaults.standard.bool(forKey: "cookies.enabled.openai")
+        lastClaudeCookieSource = UserDefaults.standard.string(forKey: "cookies.source.claude") ?? "safari"
+        lastOpenAICookieSource = UserDefaults.standard.string(forKey: "cookies.source.openai") ?? "safari"
         let url = bufferFile
         Task.detached(priority: .userInitiated) {
             let loaded = Self.loadBufferFromDisk(url: url)
@@ -86,13 +91,19 @@ final class AppViewModel: ObservableObject {
                 guard let self else { return }
                 let cookiesClaudeOn = UserDefaults.standard.bool(forKey: "cookies.enabled.claude")
                 let cookiesOpenAIOn = UserDefaults.standard.bool(forKey: "cookies.enabled.openai")
-                if self.lastClaudeCookiesEnabled != cookiesClaudeOn {
+                let claudeSource = UserDefaults.standard.string(forKey: "cookies.source.claude") ?? "safari"
+                let openAISource = UserDefaults.standard.string(forKey: "cookies.source.openai") ?? "safari"
+                if self.lastClaudeCookiesEnabled != cookiesClaudeOn || self.lastClaudeCookieSource != claudeSource {
+                    self.settingsRevision &+= 1
                     self.claudeSnapshot = nil
                     self.lastClaudeCookiesEnabled = cookiesClaudeOn
+                    self.lastClaudeCookieSource = claudeSource
                 }
-                if self.lastOpenAICookiesEnabled != cookiesOpenAIOn {
+                if self.lastOpenAICookiesEnabled != cookiesOpenAIOn || self.lastOpenAICookieSource != openAISource {
+                    self.settingsRevision &+= 1
                     self.codexSnapshot = nil
                     self.lastOpenAICookiesEnabled = cookiesOpenAIOn
+                    self.lastOpenAICookieSource = openAISource
                 }
             }
             .store(in: &cancellables)
@@ -107,6 +118,7 @@ final class AppViewModel: ObservableObject {
         defer { isRefreshing = false }
 
         let now = Date()
+        let revisionAtStart = settingsRevision
         let claudeDisplaySource = UserDefaults.standard.string(forKey: "display.source.claude") ?? "subscription"
         let codexDisplaySource  = UserDefaults.standard.string(forKey: "display.source.openai") ?? "subscription"
 
@@ -123,6 +135,14 @@ final class AppViewModel: ObservableObject {
         let claudeApiResult = await claudeApiTask
         let codexApiResult = await codexApiTask
         let usageResults = [claudeSubResult, codexSubResult, claudeApiResult, codexApiResult]
+
+        if settingsRevision != revisionAtStart {
+            // Cookie settings changed while this refresh was in flight. Do not let
+            // results fetched with the old browser/source repopulate sticky snapshots.
+            self.claudeStatus = await claudeStatTask
+            self.codexStatus = await codexStatTask
+            return
+        }
 
         self.claudeSnapshot    = preferUseful(new: claudeSubResult.snapshot,  current: claudeSnapshot,    now: now)
         self.codexSnapshot     = preferUseful(new: codexSubResult.snapshot,   current: codexSnapshot,     now: now)

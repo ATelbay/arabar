@@ -54,9 +54,9 @@ struct MenuBarLabel: View {
     }
 
     private func color(for remaining: Double) -> Color {
-        switch remaining {
-        case let r where r > 0.30: return .primary
-        case 0.10..<0.30: return .orange
+        switch Int((remaining * 100).rounded()) {
+        case 31...: return .primary
+        case 10...30: return .orange
         default: return .red
         }
     }

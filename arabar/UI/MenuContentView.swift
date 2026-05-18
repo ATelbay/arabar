@@ -328,9 +328,9 @@ struct MenuContentView: View {
     // MARK: - Helpers
 
     private func remainingColor(for remaining: Double) -> Color {
-        switch remaining {
-        case let r where r > 0.30: return .accentColor
-        case 0.10..<0.30: return .orange
+        switch Int((remaining * 100).rounded()) {
+        case 31...: return .accentColor
+        case 10...30: return .orange
         default: return .red
         }
     }

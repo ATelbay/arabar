@@ -81,9 +81,9 @@ final class ClaudeCookiesReader {
         } catch ClaudeCookiesError.cookiesNotFound {
             return "No cookies — log in to claude.ai in \(source.rawValue.capitalized)"
         } catch ClaudeCookiesError.browserUnsupported {
-            return "Browser \(source.rawValue) not yet supported (use Chrome/Brave/Edge)"
+            return "Browser \(source.rawValue) not supported"
         } catch ClaudeCookiesError.keychainAccessDenied {
-            return "Open Keychain Access.app, find 'Chrome Safe Storage', and add arabar to its Access Control list."
+            return "Open Keychain Access.app, find '\(Self.safeStorageServiceName(for: source))', and add arabar to its Access Control list."
         } catch ClaudeCookiesError.decryptionFailed {
             return "Error: Cookie decryption failed"
         } catch ClaudeCookiesError.appBoundEncryption {
@@ -110,6 +110,15 @@ final class ClaudeCookiesReader {
             case .accessDenied:           throw ClaudeCookiesError.accessDenied
             case .invalidFormat(let msg): throw ClaudeCookiesError.parsingFailed(msg)
             }
+        }
+    }
+
+    private static func safeStorageServiceName(for source: BrowserSource) -> String {
+        switch source {
+        case .safari: return "Safari cookies"
+        case .chrome: return "Chrome Safe Storage"
+        case .brave: return "Brave Safe Storage"
+        case .edge: return "Microsoft Edge Safe Storage"
         }
     }
 
