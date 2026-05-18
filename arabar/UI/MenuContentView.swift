@@ -131,8 +131,19 @@ struct MenuContentView: View {
             }
 
             if let snapshot = snapshot {
-                windowRow(label: "5h", window: snapshot.sessionWindow)
-                windowRow(label: "7d", window: snapshot.weeklyWindow)
+                if let warning = freshnessWarning(for: snapshot) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(warning.isCritical ? .red : .orange)
+                            .font(.caption2)
+                        Text(warning.text)
+                            .font(.caption2)
+                            .foregroundColor(warning.isCritical ? .red : .orange)
+                    }
+                }
+
+                windowRow(label: "5h", window: snapshot.sessionWindow, generatedAt: snapshot.generatedAt)
+                windowRow(label: "7d", window: snapshot.weeklyWindow, generatedAt: snapshot.generatedAt)
 
                 if let level = status?.level,
                    level != .operational,
@@ -181,10 +192,33 @@ struct MenuContentView: View {
         return nil
     }
 
+    // MARK: - Snapshot freshness warning helpers
+
+    private func freshnessWarning(for snapshot: UsageSnapshot) -> (text: String, isCritical: Bool)? {
+        let now = Date()
+        guard let freshness = SnapshotFreshnessPolicy.freshness(of: snapshot, now: now), freshness != .fresh else {
+            return nil
+        }
+        let prefix = freshness == .expired ? "Expired" : "Stale"
+        return ("\(prefix) · updated \(shortAge(since: snapshot.generatedAt, now: now))", freshness == .expired)
+    }
+
+    private func shortAge(since date: Date, now: Date) -> String {
+        let seconds = max(0, now.timeIntervalSince(date))
+        let minutes = Int(seconds / 60)
+        if minutes < 1 { return "just now" }
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours)h ago" }
+        let days = hours / 24
+        if days == 1 { return "yesterday" }
+        return "\(days)d ago"
+    }
+
     // MARK: - Window row (progress bar + labels)
 
     @ViewBuilder
-    private func windowRow(label: String, window: WindowSnapshot) -> some View {
+    private func windowRow(label: String, window: WindowSnapshot, generatedAt: Date) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(label)
@@ -192,11 +226,11 @@ struct MenuContentView: View {
                     .foregroundColor(.secondary)
                     .frame(width: 20, alignment: .leading)
 
-                ProgressView(value: barFillValue(for: window))
-                    .tint(progressBarColor(for: window))
+                ProgressView(value: barFillValue(for: window, generatedAt: generatedAt))
+                    .tint(progressBarColor(for: window, generatedAt: generatedAt))
                     .frame(maxWidth: .infinity)
 
-                percentLabel(for: window)
+                percentLabel(for: window, generatedAt: generatedAt)
                     .frame(width: 34, alignment: .trailing)
             }
 
@@ -216,8 +250,14 @@ struct MenuContentView: View {
     }
 
     @ViewBuilder
-    private func percentLabel(for window: WindowSnapshot) -> some View {
-        if window.percentSource == .authoritative, let pct = window.percentUsed {
+    private func percentLabel(for window: WindowSnapshot, generatedAt: Date) -> some View {
+        let now = Date()
+        if SnapshotFreshnessPolicy.shouldSuppressPercent(for: window, generatedAt: generatedAt, now: now) {
+            Text("ukwn")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .help("Cached usage data expired. Refresh to update.")
+        } else if window.percentSource == .authoritative, let pct = window.percentUsed {
             let remaining = 1.0 - pct
             Text("\(Int((remaining * 100).rounded()))%")
                 .font(.caption)
@@ -249,10 +289,12 @@ struct MenuContentView: View {
                     Text("Updated \(relativeFmt.localizedString(for: last, relativeTo: Date()))")
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                        .help("Last successful usage refresh. Failed refresh attempts do not update this time.")
                 } else {
                     Text("Not yet refreshed")
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                        .help("No usage refresh has completed successfully yet.")
                 }
             }
 
@@ -293,16 +335,19 @@ struct MenuContentView: View {
         }
     }
 
-    private func progressBarColor(for window: WindowSnapshot) -> Color {
-        if window.percentSource == .authoritative, let used = window.percentUsed {
+    private func progressBarColor(for window: WindowSnapshot, generatedAt: Date) -> Color {
+        if !SnapshotFreshnessPolicy.shouldSuppressPercent(for: window, generatedAt: generatedAt, now: Date()),
+           window.percentSource == .authoritative,
+           let used = window.percentUsed {
             return remainingColor(for: 1.0 - used)
         }
         return Color.secondary.opacity(0.3)
     }
 
     // Bar fill represents remaining (shrinks as usage grows), matching the "X% left" framing.
-    private func barFillValue(for window: WindowSnapshot) -> Double {
-        guard let used = window.percentUsed else { return 0 }
+    private func barFillValue(for window: WindowSnapshot, generatedAt: Date) -> Double {
+        guard !SnapshotFreshnessPolicy.shouldSuppressPercent(for: window, generatedAt: generatedAt, now: Date()),
+              let used = window.percentUsed else { return 0 }
         return max(0, min(1.0 - used, 1.0))
     }
 

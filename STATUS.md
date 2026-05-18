@@ -493,6 +493,8 @@ struct UsageEvent {
 
 Прошлый "[P0] Тщательное ревью всего проекта" — выполнено полностью (см. запись выше: review pass + 9 waves of fixes + rotation refactor + NSStatusItem migration).
 
+- **P1 / T35 — Cache freshness / cache expiration для sticky snapshots** — закрыто 2026-05-18. Добавлен `SnapshotFreshnessPolicy` (`fresh` ≤2m, `stale` 2–30m, `expired` >30m + per-window `resetAt` expiry). `AppViewModel.preferUseful` больше не держит expired authoritative sticky snapshots поверх JSONL/unknown fallback. Dropdown и menubar suppress-ят expired authoritative percent в `ukwn`, при этом JSONL tokens/cost остаются видимыми. Дополнительно исправлен Claude weekly parser: `utilization == 0` теперь authoritative 100% left, fractional utilization поддержан. Menubar status-triangle теперь показывается только для severe Anthropic/OpenAI outages (`partialOutage`/`majorOutage`), чтобы minor degraded status не вытеснял процент.
+
 ### Остаточный бэклог
 
 - **M3** (низкий приоритет): после удаления `.estimated` из `PercentSource`, enum обслуживает только `.authoritative` vs `.unknown` — можно упростить до `Bool isAuthoritative?` или удалить enum.

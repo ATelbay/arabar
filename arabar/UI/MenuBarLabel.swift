@@ -22,8 +22,15 @@ struct MenuBarLabel: View {
         let window = snap?.sessionWindow
         let source = window?.percentSource ?? .unknown
         let pct = window?.percentUsed ?? 0
+        let isExpired = window.map { win in
+            SnapshotFreshnessPolicy.shouldSuppressPercent(
+                for: win,
+                generatedAt: snap?.generatedAt ?? Date(),
+                now: Date()
+            )
+        } ?? false
         let logoName = (provider == .claude) ? "AnthropicLogo" : "OpenAILogo"
-        let isAlerting = status != nil && status?.level != .operational && status?.level != .unknown
+        let isAlerting = status?.level == .partialOutage || status?.level == .majorOutage
 
         HStack(spacing: 3) {
             if isAlerting {
@@ -32,13 +39,14 @@ struct MenuBarLabel: View {
                     .foregroundColor(.orange)
             }
             logoImage(named: logoName, size: 11)
-            if source == .authoritative, let _ = window?.percentUsed {
+            if !isExpired, source == .authoritative, let _ = window?.percentUsed {
                 let remaining = 1.0 - pct
                 Text("\(Int((remaining * 100).rounded()))%")
                     .foregroundColor(color(for: remaining))
             } else {
                 Text("ukwn")
                     .foregroundColor(.secondary)
+                    .help(isExpired ? "Cached usage data expired. Refresh to update." : "Subscription limit unknown — enable browser cookies in Settings for an accurate %.")
             }
         }
         .transition(.opacity)

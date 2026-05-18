@@ -118,13 +118,26 @@ final class AppViewModel: ObservableObject {
         async let claudeStatTask = StatusPagePoller.fetch(provider: .claude)
         async let codexStatTask  = StatusPagePoller.fetch(provider: .codex)
 
-        self.claudeSnapshot    = preferUseful(new: await claudeSubTask,  current: claudeSnapshot)
-        self.codexSnapshot     = preferUseful(new: await codexSubTask,   current: codexSnapshot)
-        self.claudeApiSnapshot = preferUseful(new: await claudeApiTask,  current: claudeApiSnapshot)
-        self.codexApiSnapshot  = preferUseful(new: await codexApiTask,   current: codexApiSnapshot)
+        let claudeSubResult = await claudeSubTask
+        let codexSubResult = await codexSubTask
+        let claudeApiResult = await claudeApiTask
+        let codexApiResult = await codexApiTask
+        let usageResults = [claudeSubResult, codexSubResult, claudeApiResult, codexApiResult]
+
+        self.claudeSnapshot    = preferUseful(new: claudeSubResult.snapshot,  current: claudeSnapshot,    now: now)
+        self.codexSnapshot     = preferUseful(new: codexSubResult.snapshot,   current: codexSnapshot,     now: now)
+        self.claudeApiSnapshot = preferUseful(new: claudeApiResult.snapshot,  current: claudeApiSnapshot, now: now)
+        self.codexApiSnapshot  = preferUseful(new: codexApiResult.snapshot,   current: codexApiSnapshot,  now: now)
         self.claudeStatus      = await claudeStatTask
         self.codexStatus       = await codexStatTask
-        self.lastRefreshAt     = now
+
+        // The footer timestamp means "last successful usage refresh".
+        // Do not move it forward when a configured usage request failed and we only kept
+        // sticky/cached data, otherwise offline/stale data looks freshly updated.
+        if usageResults.contains(where: { $0.didRefreshSource })
+            && !usageResults.contains(where: { $0.didFailSource }) {
+            self.lastRefreshAt = now
+        }
 
         // Update cookie expiry dates for TTL warning UX
         // CookieExpiry.forProvider is pure sync — structured Task is fine here
@@ -142,26 +155,36 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - Sticky-snapshot helpers
 
+    private struct SnapshotRefreshResult {
+        let snapshot: UsageSnapshot?
+        let didRefreshSource: Bool
+        let didFailSource: Bool
+    }
+
     /// Returns the most useful snapshot between a freshly-fetched value and the previously cached one.
-    /// If the new snapshot is useful (has authoritative percentSource), it wins.
-    /// If the new snapshot is transient/degraded but the current one is useful, keep the current one.
-    /// This prevents a single bad refresh cycle from flickering the display to ukwn/estimated.
-    private func preferUseful(new: UsageSnapshot?, current: UsageSnapshot?) -> UsageSnapshot? {
+    /// If the new snapshot has non-expired authoritative percent data, it wins.
+    /// If the new snapshot is transient/degraded but the current one still has fresh/stale
+    /// authoritative data, keep the current one briefly to avoid flicker.
+    /// Expired authoritative sticky snapshots must not mask a newer JSONL/unknown fallback.
+    private func preferUseful(new: UsageSnapshot?, current: UsageSnapshot?, now: Date) -> UsageSnapshot? {
         guard let current = current else { return new }
-        if isUseful(new) { return new }
-        if isUseful(current) { return current }
+        if isUseful(new, now: now) { return new }
+        if isUseful(current, now: now) { return current }
+        if new == nil, SnapshotFreshnessPolicy.hasAuthoritativeData(current) {
+            // Keep expired authoritative context only when there is no fallback at all;
+            // UI suppresses its percent and marks it expired.
+            return current
+        }
         return new
     }
 
-    private func isUseful(_ snap: UsageSnapshot?) -> Bool {
-        guard let s = snap else { return false }
-        return s.sessionWindow.percentSource == .authoritative
-            || s.weeklyWindow.percentSource == .authoritative
+    private func isUseful(_ snap: UsageSnapshot?, now: Date) -> Bool {
+        SnapshotFreshnessPolicy.hasDisplayableAuthoritativeData(snap, now: now)
     }
 
     // MARK: - Subscription source: cookies → JSONL fallback
 
-    private func computeSubscriptionSnapshot(provider: Provider, now: Date) async -> UsageSnapshot? {
+    private func computeSubscriptionSnapshot(provider: Provider, now: Date) async -> SnapshotRefreshResult {
         let cookiesKey = provider == .claude ? "cookies.enabled.claude" : "cookies.enabled.openai"
         if UserDefaults.standard.bool(forKey: cookiesKey) {
             // Kick off JSONL in parallel — it's cheap (in-memory buffer after first load)
@@ -175,16 +198,31 @@ final class AppViewModel: ObservableObject {
                     cookiesSnap = try await openaiCookieReader.fetchSnapshot()
                 }
                 let jsonlSnap = await jsonlTask
-                return mergedSnapshot(cookies: cookiesSnap, jsonl: jsonlSnap)
+                return SnapshotRefreshResult(
+                    snapshot: mergedSnapshot(cookies: cookiesSnap, jsonl: jsonlSnap),
+                    didRefreshSource: true,
+                    didFailSource: false
+                )
             } catch {
-                // Non-fatal: fall through to JSONL result already computing
+                // Non-fatal: fall through to JSONL result already computing, but do not
+                // mark the refresh timestamp as successful: the configured remote usage
+                // request failed, so any sticky authoritative snapshot remains stale.
                 self.lastError = "\(provider) cookies: \(error.localizedDescription)"
-                return await jsonlTask
+                return SnapshotRefreshResult(
+                    snapshot: await jsonlTask,
+                    didRefreshSource: false,
+                    didFailSource: true
+                )
             }
         }
 
         // JSONL only (cookies disabled)
-        return await jsonlSnapshot(for: provider, now: now)
+        let jsonlSnap = await jsonlSnapshot(for: provider, now: now)
+        return SnapshotRefreshResult(
+            snapshot: jsonlSnap,
+            didRefreshSource: jsonlSnap != nil,
+            didFailSource: false
+        )
     }
 
     // MARK: - Merge helpers
@@ -218,7 +256,7 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - API source: Admin key only
 
-    private func computeAPISnapshot(provider: Provider, now: Date) async -> UsageSnapshot? {
+    private func computeAPISnapshot(provider: Provider, now: Date) async -> SnapshotRefreshResult {
         do {
             let events: [UsageEvent]
             switch provider {
@@ -228,10 +266,22 @@ final class AppViewModel: ObservableObject {
                 events = try await OpenAIUsageAPIReader().fetchEvents(lookbackDays: 30)
             }
             let snapshots = aggregator.aggregate(events: events, now: now)
-            return snapshots[provider]
+            return SnapshotRefreshResult(
+                snapshot: snapshots[provider],
+                didRefreshSource: true,
+                didFailSource: false
+            )
+        } catch AnthropicAdminAPIError.missingKey {
+            // No key configured = source is not active, not a failed refresh.
+            return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
+        } catch AnthropicAdminAPIError.disabled {
+            return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
+        } catch OpenAIUsageAPIError.missingKey {
+            return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
+        } catch OpenAIUsageAPIError.disabled {
+            return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
         } catch {
-            // .missingKey is expected when no key is configured — silently return nil
-            return nil
+            return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: true)
         }
     }
 

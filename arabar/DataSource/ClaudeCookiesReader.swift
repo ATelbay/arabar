@@ -345,8 +345,8 @@ final class ClaudeCookiesReader {
     }
 
     private func parseUsageSnapshot(json: [String: Any]) -> UsageSnapshot {
-        let sessionWindow = parseWindow(from: json["five_hour"] as? [String: Any], durationHours: 5)
-        let weeklyWindow = parseWindow(from: json["seven_day"] as? [String: Any], durationHours: 168)
+        let sessionWindow = Self.parseWindowSnapshot(from: json["five_hour"] as? [String: Any], durationHours: 5)
+        let weeklyWindow = Self.parseWindowSnapshot(from: json["seven_day"] as? [String: Any], durationHours: 168)
 
         return UsageSnapshot(
             provider: .claude,
@@ -357,13 +357,14 @@ final class ClaudeCookiesReader {
         )
     }
 
-    /// Maps a usage window dict `{ utilization: Int (0–100), resets_at: String? }` → WindowSnapshot.
-    private func parseWindow(from dict: [String: Any]?, durationHours: Int) -> WindowSnapshot {
-        guard let dict = dict else {
-            return WindowSnapshot(durationHours: durationHours, tokensUsed: 0, costUSD: 0, percentUsed: nil, resetAt: nil, percentSource: .authoritative)
+    /// Maps a usage window dict `{ utilization: Number (0–100), resets_at: String? }` → WindowSnapshot.
+    /// Important: `0` is a real authoritative value (100% left), not unknown.
+    static func parseWindowSnapshot(from dict: [String: Any]?, durationHours: Int) -> WindowSnapshot {
+        guard let dict else {
+            return WindowSnapshot(durationHours: durationHours, tokensUsed: 0, costUSD: 0, percentUsed: nil, resetAt: nil, percentSource: .unknown)
         }
-        let utilizationRaw = dict["utilization"] as? Int ?? 0
-        let percentUsed = Double(utilizationRaw) / 100.0
+
+        let percentUsed = utilizationFraction(from: dict["utilization"])
 
         var resetAt: Date?
         if let resetsAtStr = dict["resets_at"] as? String {
@@ -373,10 +374,28 @@ final class ClaudeCookiesReader {
             durationHours: durationHours,
             tokensUsed: 0,
             costUSD: 0,
-            percentUsed: utilizationRaw > 0 ? percentUsed : nil,
+            percentUsed: percentUsed,
             resetAt: resetAt,
-            percentSource: .authoritative
+            percentSource: percentUsed == nil ? .unknown : .authoritative
         )
+    }
+
+    static func utilizationFraction(from raw: Any?) -> Double? {
+        let rawPercent: Double?
+        switch raw {
+        case let number as NSNumber where CFGetTypeID(number) != CFBooleanGetTypeID():
+            rawPercent = number.doubleValue
+        case let string as String:
+            rawPercent = Double(string)
+        case let double as Double:
+            rawPercent = double
+        case let int as Int:
+            rawPercent = Double(int)
+        default:
+            rawPercent = nil
+        }
+        guard let rawPercent, rawPercent.isFinite else { return nil }
+        return min(max(rawPercent / 100.0, 0.0), 1.0)
     }
 
     /// Fetches account email from GET /api/account (best-effort, never throws).
@@ -412,7 +431,7 @@ final class ClaudeCookiesReader {
         return request
     }
 
-    private func parseISO8601(_ string: String) -> Date? {
+    private static func parseISO8601(_ string: String) -> Date? {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let d = f.date(from: string) { return d }
