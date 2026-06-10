@@ -74,6 +74,9 @@ final class MenuBarController: NSObject {
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            // Refresh on open so a just-completed browser re-login is reflected immediately
+            // instead of waiting up to the 60s timer tick.
+            Task { await viewModel.refresh() }
         }
     }
 }
