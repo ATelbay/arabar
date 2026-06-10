@@ -54,7 +54,7 @@ struct MenuContentView: View {
             // ── Codex / ChatGPT primary section ─────────────────────────
             providerSection(
                 icon: "message.fill",
-                title: "ChatGPT / Codex",
+                title: "ChatGPT",
                 snapshot: viewModel.codexSnapshot,
                 status: viewModel.codexStatus,
                 provider: .codex
@@ -130,6 +130,28 @@ struct MenuContentView: View {
                 }
             }
 
+            // Session expired → offer to re-login in the browser arabar reads cookies from.
+            if let p = provider, sessionExpired(for: p) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "person.crop.circle.badge.exclamationmark")
+                            .foregroundColor(.red)
+                            .font(.caption2)
+                        Text("Session expired — log in to refresh")
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                    }
+                    Button {
+                        BrowserLauncher.openLogin(for: p)
+                    } label: {
+                        Text("Open \(p == .codex ? "chatgpt.com" : "claude.ai")…")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.link)
+                    .help("Opens the site in your configured browser. Logging in refreshes the cookie arabar reads; the next refresh will pick it up.")
+                }
+            }
+
             if let snapshot = snapshot {
                 if let warning = freshnessWarning(for: snapshot) {
                     HStack(spacing: 4) {
@@ -173,6 +195,13 @@ struct MenuContentView: View {
         switch provider {
         case .claude: return viewModel.claudeCookieExpiresAt
         case .codex:  return viewModel.codexCookieExpiresAt
+        }
+    }
+
+    private func sessionExpired(for provider: Provider) -> Bool {
+        switch provider {
+        case .claude: return viewModel.claudeSessionExpired
+        case .codex:  return viewModel.codexSessionExpired
         }
     }
 

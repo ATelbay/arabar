@@ -21,7 +21,7 @@ enum OpenAICookiesError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .sessionExchangeFailed(let code):
-            return "ChatGPT session expired — log out and back in on chatgpt.com (HTTP \(code))"
+            return "ChatGPT session token expired — open chatgpt.com in your browser to refresh it (or log out and back in) [HTTP \(code)]"
         default:
             return nil
         }
@@ -146,7 +146,7 @@ final class OpenAICookiesReader {
         } catch OpenAICookiesError.httpError(let code) {
             return "Error: HTTP \(code) from ChatGPT API"
         } catch OpenAICookiesError.sessionExchangeFailed(let code) {
-            return "ChatGPT session expired — log out and back in on chatgpt.com (HTTP \(code))"
+            return "ChatGPT session token expired — open chatgpt.com in your browser to refresh it (or log out and back in) [HTTP \(code)]"
         } catch OpenAICookiesError.parsingFailed(let detail) {
             return "Error: response parse failed — \(detail)"
         } catch {
@@ -378,6 +378,11 @@ final class OpenAICookiesReader {
         let sessionURL = URL(string: "https://chatgpt.com/api/auth/session")!
         var req = URLRequest(url: sessionURL)
         req.timeoutInterval = 8
+        // Bypass any cached response so NextAuth's server-side jwt callback re-runs and
+        // refreshes the underlying access token instead of replaying a stale cached body.
+        // We cannot refresh the token ourselves — the Auth0 refresh token is sealed inside
+        // the server-encrypted session JWE — so forcing a live refresh is the only lever.
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
         req.setValue(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -413,13 +418,48 @@ final class OpenAICookiesReader {
         }
 
         let accountId = sessionResp.user?.id
-        debugLog(openaiLog, "auth/session: token length=\(token.count), accountId present=\(accountId != nil ? "YES" : "NO")")
+        debugLog(openaiLog, "auth/session: token length=\(token.count), accountId present=\(accountId != nil ? "YES" : "NO"), expired=\(Self.jwtIsExpired(token) ? "YES" : "NO")")
         return (token, accountId)
+    }
+
+    // MARK: - JWT expiry
+
+    /// Reads the `exp` claim (seconds since epoch) from a JWT payload. nil if unparseable.
+    private static func jwtExpiry(_ token: String) -> Date? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var b64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64.append("=") }
+        guard let data = Data(base64Encoded: b64),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        if let exp = obj["exp"] as? Double { return Date(timeIntervalSince1970: exp) }
+        if let exp = obj["exp"] as? Int { return Date(timeIntervalSince1970: Double(exp)) }
+        return nil
+    }
+
+    /// True only when `exp` is readable AND already in the past (30s skew). Unknown → false,
+    /// so an unparseable token is left for the server to accept or reject rather than blocked.
+    private static func jwtIsExpired(_ token: String, now: Date = Date()) -> Bool {
+        guard let exp = jwtExpiry(token) else { return false }
+        return exp.addingTimeInterval(30) < now
     }
 
     private func fetchUsage(cookieHeader: String) async throws -> UsageSnapshot {
         // Step 1: Exchange cookies for a Bearer token via NextAuth session endpoint.
         let (accessToken, accountId) = try await fetchAccessToken(cookieHeader: cookieHeader)
+
+        // The session endpoint serves the access token embedded in the cookie's session JWE.
+        // When the user's browser has been idle, that token is already expired and the server
+        // will NOT refresh it for us (the refresh token is sealed server-side and only the
+        // chatgpt.com web app triggers a refresh). Detect this up front and surface an
+        // actionable error instead of firing a request we know returns 401 token_expired.
+        if Self.jwtIsExpired(accessToken) {
+            throw OpenAICookiesError.sessionExchangeFailed(httpCode: 401)
+        }
 
         // Step 2: Fetch wham/usage with Bearer auth — do NOT send Cookie header here.
         var req = URLRequest(url: Self.limitsURL)
@@ -442,7 +482,14 @@ final class OpenAICookiesReader {
         }
         debugLog(openaiLog, "wham/usage HTTP \(http.statusCode), body=\(data.count) bytes")
 
-        if http.statusCode == 401 || http.statusCode == 403 {
+        // Fallback for the case the proactive expiry check missed (e.g. token expired in
+        // the gap between the two requests, or an unparseable token the server still rejects).
+        // A 401 means the token is stale → surface the re-login error rather than a silent
+        // `ukwn`. A plain 403 is a genuine access problem (no eligible plan) → leave as unknown.
+        if http.statusCode == 401 {
+            throw OpenAICookiesError.sessionExchangeFailed(httpCode: 401)
+        }
+        if http.statusCode == 403 {
             return emptySnapshot()
         }
         guard http.statusCode == 200 else {

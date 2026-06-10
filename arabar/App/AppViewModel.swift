@@ -23,6 +23,10 @@ final class AppViewModel: ObservableObject {
     @Published var claudeCookieExpiresAt: Date?
     @Published var codexCookieExpiresAt: Date?
 
+    // MARK: - Session-expired state (cookies present but the login token is dead → re-login)
+    @Published var claudeSessionExpired: Bool = false
+    @Published var codexSessionExpired: Bool = false
+
     // MARK: - Menubar rotation
     // Driven from here so the Timer lives in a stable @StateObject instead of a View struct
     // (View structs are re-created on every parent re-render, which resets local Timer publishers).
@@ -146,6 +150,8 @@ final class AppViewModel: ObservableObject {
 
         self.claudeSnapshot    = preferUseful(new: claudeSubResult.snapshot,  current: claudeSnapshot,    now: now)
         self.codexSnapshot     = preferUseful(new: codexSubResult.snapshot,   current: codexSnapshot,     now: now)
+        self.claudeSessionExpired = claudeSubResult.sessionExpired
+        self.codexSessionExpired  = codexSubResult.sessionExpired
         self.claudeApiSnapshot = preferUseful(new: claudeApiResult.snapshot,  current: claudeApiSnapshot, now: now)
         self.codexApiSnapshot  = preferUseful(new: codexApiResult.snapshot,   current: codexApiSnapshot,  now: now)
         self.claudeStatus      = await claudeStatTask
@@ -179,6 +185,16 @@ final class AppViewModel: ObservableObject {
         let snapshot: UsageSnapshot?
         let didRefreshSource: Bool
         let didFailSource: Bool
+        var sessionExpired: Bool = false
+    }
+
+    /// True when an error means the browser login token is dead (cookies present but rejected),
+    /// so the fix is a re-login rather than a transient retry.
+    private static func isSessionExpiredError(_ error: Error) -> Bool {
+        if case OpenAICookiesError.sessionExchangeFailed = error { return true }
+        if case OpenAICookiesError.httpError(let c) = error, c == 401 || c == 403 { return true }
+        if case ClaudeCookiesError.httpError(let c) = error, c == 401 || c == 403 { return true }
+        return false
     }
 
     /// Returns the most useful snapshot between a freshly-fetched value and the previously cached one.
@@ -231,7 +247,8 @@ final class AppViewModel: ObservableObject {
                 return SnapshotRefreshResult(
                     snapshot: await jsonlTask,
                     didRefreshSource: false,
-                    didFailSource: true
+                    didFailSource: true,
+                    sessionExpired: Self.isSessionExpiredError(error)
                 )
             }
         }
