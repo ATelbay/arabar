@@ -1,14 +1,48 @@
 import SwiftUI
 
+enum QuotaWindowVisibility {
+    /// An authoritative sibling proves the subscription endpoint answered successfully.
+    /// In that case, an empty unknown window was omitted by the provider and should not be
+    /// rendered as a permanent `ukwn` lane. JSONL-only snapshots keep both rows because
+    /// neither sibling is authoritative.
+    static func shouldShow(_ window: WindowSnapshot, sibling: WindowSnapshot) -> Bool {
+        let wasOmittedByProvider = window.percentSource == .unknown
+            && window.percentUsed == nil
+            && window.resetAt == nil
+            && window.tokensUsed == 0
+            && window.costUSD == 0
+        return !(wasOmittedByProvider && sibling.percentSource == .authoritative)
+    }
+}
+
+enum MenuValueFormatter {
+    static func tokens(_ count: Int) -> String {
+        if count >= 1_000_000 {
+            let millions = Double(count) / 1_000_000
+            return String(format: "%.1fM", millions)
+        } else if count >= 1_000 {
+            let thousands = Double(count) / 1_000
+            return String(format: "%.1fk", thousands)
+        }
+        return "\(count)"
+    }
+
+    static func cost(_ usd: Double) -> String {
+        String(format: "$%.2f", usd)
+    }
+}
+
 struct MenuContentView: View {
     @ObservedObject var viewModel: AppViewModel
     @StateObject private var loginItem = LoginItemController()
     @Environment(\.openWindow) private var openWindow
+    @AppStorage("display.provider.claude") private var showClaude = true
+    @AppStorage("display.provider.openai") private var showOpenAI = true
 
     private let relativeFmt: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
     }()
 
     var body: some View {
@@ -18,68 +52,80 @@ struct MenuContentView: View {
                 .font(.headline)
                 .padding(.bottom, 8)
 
-            // ── Claude primary section ───────────────────────────────────
-            providerSection(
-                icon: "brain",
-                title: "Claude Code",
-                snapshot: viewModel.claudeSnapshot,
-                status: viewModel.claudeStatus,
-                provider: .claude
-            )
-
-            // ── Claude API secondary section (only when distinct) ────────
-            if let apiSnap = viewModel.claudeApiSnapshot, apiSnap != viewModel.claudeSnapshot {
-                Divider().padding(.vertical, 4)
-                if viewModel.claudeSnapshot != nil {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                            .font(.caption2)
-                        Text("Subscription + API may count same tokens twice")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
+            if showClaude {
+                // ── Claude primary section ───────────────────────────────
                 providerSection(
-                    icon: "bolt.circle",
-                    title: "Claude API",
-                    snapshot: apiSnap,
-                    status: nil,
-                    provider: nil
+                    icon: "brain",
+                    title: "Claude Code",
+                    snapshot: viewModel.claudeSnapshot,
+                    status: viewModel.claudeStatus,
+                    provider: .claude
                 )
+
+                // ── Claude API secondary section (only when distinct) ────
+                if let apiSnap = viewModel.claudeApiSnapshot, apiSnap != viewModel.claudeSnapshot {
+                    Divider().padding(.vertical, 4)
+                    if viewModel.claudeSnapshot != nil {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                                .font(.caption2)
+                            Text("Subscription + API may count same tokens twice")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    providerSection(
+                        icon: "bolt.circle",
+                        title: "Claude API",
+                        snapshot: apiSnap,
+                        status: nil,
+                        provider: nil
+                    )
+                }
             }
 
-            Divider().padding(.vertical, 8)
+            if showClaude && showOpenAI {
+                Divider().padding(.vertical, 8)
+            }
 
-            // ── Codex / ChatGPT primary section ─────────────────────────
-            providerSection(
-                icon: "message.fill",
-                title: "ChatGPT",
-                snapshot: viewModel.codexSnapshot,
-                status: viewModel.codexStatus,
-                provider: .codex
-            )
-
-            // ── OpenAI API secondary section (only when distinct) ────────
-            if let apiSnap = viewModel.codexApiSnapshot, apiSnap != viewModel.codexSnapshot {
-                Divider().padding(.vertical, 4)
-                if viewModel.codexSnapshot != nil {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                            .font(.caption2)
-                        Text("Subscription + API may count same tokens twice")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
+            if showOpenAI {
+                // ── Codex / ChatGPT primary section ─────────────────────
                 providerSection(
-                    icon: "bolt.circle",
-                    title: "OpenAI API",
-                    snapshot: apiSnap,
-                    status: nil,
-                    provider: nil
+                    icon: "message.fill",
+                    title: "ChatGPT / Codex",
+                    snapshot: viewModel.codexSnapshot,
+                    status: viewModel.codexStatus,
+                    provider: .codex
                 )
+
+                // ── OpenAI API secondary section (only when distinct) ────
+                if let apiSnap = viewModel.codexApiSnapshot, apiSnap != viewModel.codexSnapshot {
+                    Divider().padding(.vertical, 4)
+                    if viewModel.codexSnapshot != nil {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                                .font(.caption2)
+                            Text("Subscription + API may count same tokens twice")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    providerSection(
+                        icon: "bolt.circle",
+                        title: "OpenAI API",
+                        snapshot: apiSnap,
+                        status: nil,
+                        provider: nil
+                    )
+                }
+            }
+
+            if !showClaude && !showOpenAI {
+                Text("No providers selected")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
 
             Divider().padding(.vertical, 8)
@@ -117,8 +163,8 @@ struct MenuContentView: View {
             }
 
             // Cookie TTL warning
-            if let p = provider,
-               let expiry = expiryDate(for: p),
+            if let provider,
+               let expiry = expiryDate(for: provider),
                let warning = expiryWarning(from: expiry) {
                 HStack(spacing: 4) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -131,7 +177,7 @@ struct MenuContentView: View {
             }
 
             // Session expired → offer to re-login in the browser arabar reads cookies from.
-            if let p = provider, sessionExpired(for: p) {
+            if let provider, sessionExpired(for: provider) {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 4) {
                         Image(systemName: "person.crop.circle.badge.exclamationmark")
@@ -142,13 +188,16 @@ struct MenuContentView: View {
                             .foregroundColor(.red)
                     }
                     Button {
-                        BrowserLauncher.openLogin(for: p)
+                        BrowserLauncher.openLogin(for: provider)
                     } label: {
-                        Text("Open \(p == .codex ? "chatgpt.com" : "claude.ai")…")
+                        Text("Open \(provider == .codex ? "chatgpt.com" : "claude.ai")…")
                             .font(.caption2)
                     }
                     .buttonStyle(.link)
-                    .help("Opens the site in your configured browser. Logging in refreshes the cookie arabar reads; the next refresh will pick it up.")
+                    .help(
+                        "Opens the site in your configured browser. Logging in refreshes "
+                            + "the cookie arabar reads; the next refresh will pick it up."
+                    )
                 }
             }
 
@@ -164,8 +213,18 @@ struct MenuContentView: View {
                     }
                 }
 
-                windowRow(label: "5h", window: snapshot.sessionWindow, generatedAt: snapshot.generatedAt)
-                windowRow(label: "7d", window: snapshot.weeklyWindow, generatedAt: snapshot.generatedAt)
+                if QuotaWindowVisibility.shouldShow(
+                    snapshot.sessionWindow,
+                    sibling: snapshot.weeklyWindow
+                ) {
+                    windowRow(label: "5h", window: snapshot.sessionWindow, generatedAt: snapshot.generatedAt)
+                }
+                if QuotaWindowVisibility.shouldShow(
+                    snapshot.weeklyWindow,
+                    sibling: snapshot.sessionWindow
+                ) {
+                    windowRow(label: "7d", window: snapshot.weeklyWindow, generatedAt: snapshot.generatedAt)
+                }
 
                 if let level = status?.level,
                    level != .operational,
@@ -265,7 +324,10 @@ struct MenuContentView: View {
 
             HStack {
                 Spacer().frame(width: 24)
-                Text("\(formatTokens(window.tokensUsed)) tokens · \(formatCost(window.costUSD))")
+                Text(
+                    "\(MenuValueFormatter.tokens(window.tokensUsed)) tokens · "
+                        + MenuValueFormatter.cost(window.costUSD)
+                )
                     .font(.caption2)
                     .foregroundColor(.secondary)
                 Spacer()
@@ -378,21 +440,6 @@ struct MenuContentView: View {
         guard !SnapshotFreshnessPolicy.shouldSuppressPercent(for: window, generatedAt: generatedAt, now: Date()),
               let used = window.percentUsed else { return 0 }
         return max(0, min(1.0 - used, 1.0))
-    }
-
-    private func formatTokens(_ n: Int) -> String {
-        if n >= 1_000_000 {
-            let m = Double(n) / 1_000_000
-            return String(format: "%.1fM", m)
-        } else if n >= 1_000 {
-            let k = Double(n) / 1_000
-            return String(format: "%.1fk", k)
-        }
-        return "\(n)"
-    }
-
-    private func formatCost(_ usd: Double) -> String {
-        String(format: "$%.2f", usd)
     }
 
     private func resetIn(_ date: Date) -> String {

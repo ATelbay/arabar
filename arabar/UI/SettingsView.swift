@@ -45,6 +45,8 @@ private func expiryColor(_ status: String) -> Color {
 struct SettingsView: View {
     var body: some View {
         TabView {
+            ProviderVisibilitySettingsTab()
+                .tabItem { Label("Display", systemImage: "eye") }
             ClaudeSettingsTab()
                 .tabItem { Label("Claude", systemImage: "brain") }
             OpenAISettingsTab()
@@ -53,6 +55,28 @@ struct SettingsView: View {
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
         .frame(width: 480, height: 560)
+    }
+}
+
+// MARK: - Provider visibility
+
+private struct ProviderVisibilitySettingsTab: View {
+    @AppStorage("display.provider.claude") private var showClaude = true
+    @AppStorage("display.provider.openai") private var showOpenAI = true
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Claude Code", isOn: $showClaude)
+                Toggle("ChatGPT / Codex", isOn: $showOpenAI)
+            } header: {
+                Text("Providers shown")
+            } footer: {
+                Text("Hidden providers stay configured and can be added back at any time.")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
     }
 }
 
@@ -251,19 +275,19 @@ private struct ProviderSettingsTab: View {
 
             // ── Display preference ───────────────────────────────────────
             Section {
-                Picker("Show in menubar", selection: $displaySource) {
+                Picker("Usage source", selection: $displaySource) {
                     Text("Subscription").tag("subscription")
                     Text("API tier").tag("api")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
 
-                Text("Choose which source drives the menubar display.")
+                Text("Choose which source drives this provider's usage display.")
                     .font(.caption)
                     .foregroundColor(.secondary)
 
             } header: {
-                Text("Display in menubar")
+                Text("Usage source")
             }
         }
         .formStyle(.grouped)

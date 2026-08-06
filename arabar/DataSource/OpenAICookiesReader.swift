@@ -41,9 +41,10 @@ private struct SessionResponse: Decodable {
     let expires: String?
 }
 
-/// chatgpt.com/backend-api/wham/usage — schema reverse-engineered from CodexBar.
-/// Returns authoritative rate-limit utilization (0..100) and reset times for both windows.
-private struct WhamUsageResponse: Decodable {
+/// chatgpt.com/backend-api/wham/usage response.
+/// The endpoint can put a weekly-only limit in `primary_window`, so field order alone does
+/// not identify which UI row a window belongs to.
+struct WhamUsageResponse: Decodable {
     let planType: String?
     let rateLimit: RateLimitDetails?
 
@@ -53,8 +54,8 @@ private struct WhamUsageResponse: Decodable {
     }
 
     struct RateLimitDetails: Decodable {
-        let primaryWindow: WindowSnapshot?
-        let secondaryWindow: WindowSnapshot?
+        let primaryWindow: RateWindow?
+        let secondaryWindow: RateWindow?
 
         enum CodingKeys: String, CodingKey {
             case primaryWindow = "primary_window"
@@ -62,16 +63,128 @@ private struct WhamUsageResponse: Decodable {
         }
     }
 
-    struct WindowSnapshot: Decodable {
+    struct RateWindow: Decodable {
         let usedPercent: Int
-        let resetAt: Int             // Unix seconds
-        let limitWindowSeconds: Int  // 18000 (5h) or 604800 (7d)
+        let resetAt: Int
+        let limitWindowSeconds: Int
 
         enum CodingKeys: String, CodingKey {
             case usedPercent = "used_percent"
             case resetAt = "reset_at"
             case limitWindowSeconds = "limit_window_seconds"
         }
+    }
+}
+
+enum OpenAIUsageSnapshotMapper {
+    private enum WindowRole {
+        case session
+        case weekly
+        case unknown
+    }
+
+    /// Test seam for provider response fixtures.
+    static func decodeSnapshot(_ data: Data, generatedAt: Date) throws -> UsageSnapshot {
+        let usage = try JSONDecoder().decode(WhamUsageResponse.self, from: data)
+        return snapshot(from: usage, generatedAt: generatedAt)
+    }
+
+    static func snapshot(from usage: WhamUsageResponse, generatedAt: Date) -> UsageSnapshot {
+        let normalized = normalizedWindows(
+            primary: usage.rateLimit?.primaryWindow,
+            secondary: usage.rateLimit?.secondaryWindow
+        )
+        return UsageSnapshot(
+            provider: .codex,
+            generatedAt: generatedAt,
+            sessionWindow: window(from: normalized.session, fallbackHours: 5),
+            weeklyWindow: window(from: normalized.weekly, fallbackHours: 168),
+            totalEventsInPeriod: 0
+        )
+    }
+
+    static func emptySnapshot(generatedAt: Date) -> UsageSnapshot {
+        UsageSnapshot(
+            provider: .codex,
+            generatedAt: generatedAt,
+            sessionWindow: missingWindow(durationHours: 5),
+            weeklyWindow: missingWindow(durationHours: 168),
+            totalEventsInPeriod: 0
+        )
+    }
+
+    /// Known windows are classified by their actual duration rather than by the provider's
+    /// primary/secondary field names. Free accounts can expose a 7-day-only primary window.
+    private static func normalizedWindows(
+        primary: WhamUsageResponse.RateWindow?,
+        secondary: WhamUsageResponse.RateWindow?
+    ) -> (session: WhamUsageResponse.RateWindow?, weekly: WhamUsageResponse.RateWindow?) {
+        switch (primary, secondary) {
+        case let (.some(primaryWindow), .some(secondaryWindow)):
+            switch (role(for: primaryWindow), role(for: secondaryWindow)) {
+            case (.session, .weekly), (.session, .unknown), (.unknown, .weekly):
+                return (primaryWindow, secondaryWindow)
+            case (.weekly, .session), (.weekly, .unknown):
+                return (secondaryWindow, primaryWindow)
+            default:
+                return (primaryWindow, secondaryWindow)
+            }
+        case let (.some(primaryWindow), .none):
+            return role(for: primaryWindow) == .weekly
+                ? (nil, primaryWindow)
+                : (primaryWindow, nil)
+        case let (.none, .some(secondaryWindow)):
+            return role(for: secondaryWindow) == .weekly
+                ? (nil, secondaryWindow)
+                : (secondaryWindow, nil)
+        case (.none, .none):
+            return (nil, nil)
+        }
+    }
+
+    private static func role(for window: WhamUsageResponse.RateWindow) -> WindowRole {
+        switch window.limitWindowSeconds {
+        case 5 * 60 * 60:
+            return .session
+        case 7 * 24 * 60 * 60:
+            return .weekly
+        default:
+            return .unknown
+        }
+    }
+
+    private static func window(
+        from rateWindow: WhamUsageResponse.RateWindow?,
+        fallbackHours: Int
+    ) -> WindowSnapshot {
+        guard let rateWindow else {
+            return missingWindow(durationHours: fallbackHours)
+        }
+        let hours = rateWindow.limitWindowSeconds > 0
+            ? rateWindow.limitWindowSeconds / 3600
+            : fallbackHours
+        // The endpoint reports used_percent with a floor of 1. Subtract that floor so an
+        // otherwise idle account reads as 100% remaining rather than 99%.
+        let adjustedUsedPercent = max(0, rateWindow.usedPercent - 1)
+        return WindowSnapshot(
+            durationHours: hours,
+            tokensUsed: 0,
+            costUSD: 0,
+            percentUsed: Double(adjustedUsedPercent) / 100.0,
+            resetAt: Date(timeIntervalSince1970: TimeInterval(rateWindow.resetAt)),
+            percentSource: .authoritative
+        )
+    }
+
+    private static func missingWindow(durationHours: Int) -> WindowSnapshot {
+        WindowSnapshot(
+            durationHours: durationHours,
+            tokensUsed: 0,
+            costUSD: 0,
+            percentUsed: nil,
+            resetAt: nil,
+            percentSource: .unknown
+        )
     }
 }
 
@@ -159,8 +272,8 @@ final class OpenAICookiesReader {
     private func mapSafariError<T>(_ body: () throws -> T) throws -> T {
         do {
             return try body()
-        } catch let e as SafariCookiesError {
-            switch e.category {
+        } catch let safariError as SafariCookiesError {
+            switch safariError.category {
             case .fileNotFound:           throw OpenAICookiesError.cookiesNotFound
             case .accessDenied:           throw OpenAICookiesError.accessDenied
             case .invalidFormat(let msg): throw OpenAICookiesError.parsingFailed(msg)
@@ -292,8 +405,8 @@ final class OpenAICookiesReader {
             var value: String?
 
             if let valPtr = sqlite3_column_text(stmt, 1), sqlite3_column_bytes(stmt, 1) > 0 {
-                let v = String(cString: valPtr)
-                if !v.isEmpty { value = v }
+                let cookieValue = String(cString: valPtr)
+                if !cookieValue.isEmpty { value = cookieValue }
             }
 
             if value == nil || value!.isEmpty {
@@ -322,8 +435,8 @@ final class OpenAICookiesReader {
                 }
             }
 
-            if let v = value, !v.isEmpty {
-                pairs.append((name, v))
+            if let cookieValue = value, !cookieValue.isEmpty {
+                pairs.append((name, cookieValue))
             }
         }
 
@@ -341,10 +454,10 @@ final class OpenAICookiesReader {
         let bare = pairs.first(where: { $0.0 == Self.sessionCookiePrefix })
         let chunks = pairs
             .filter { $0.0 != Self.sessionCookiePrefix && $0.0.hasPrefix(Self.sessionCookiePrefix + ".") }
-            .sorted { a, b in
-                let na = Int(a.0.dropFirst(Self.sessionCookiePrefix.count + 1)) ?? 0
-                let nb = Int(b.0.dropFirst(Self.sessionCookiePrefix.count + 1)) ?? 0
-                return na < nb
+            .sorted { lhs, rhs in
+                let lhsIndex = Int(lhs.0.dropFirst(Self.sessionCookiePrefix.count + 1)) ?? 0
+                let rhsIndex = Int(rhs.0.dropFirst(Self.sessionCookiePrefix.count + 1)) ?? 0
+                return lhsIndex < rhsIndex
             }
 
         if let bare = bare {
@@ -490,7 +603,7 @@ final class OpenAICookiesReader {
             throw OpenAICookiesError.sessionExchangeFailed(httpCode: 401)
         }
         if http.statusCode == 403 {
-            return emptySnapshot()
+            return OpenAIUsageSnapshotMapper.emptySnapshot(generatedAt: Date())
         }
         guard http.statusCode == 200 else {
             throw OpenAICookiesError.httpError(http.statusCode)
@@ -498,56 +611,21 @@ final class OpenAICookiesReader {
 
         do {
             let usage = try JSONDecoder().decode(WhamUsageResponse.self, from: data)
-            debugLog(openaiLog, "wham parsed: plan=\(usage.planType ?? "?"), primary=\(usage.rateLimit?.primaryWindow.map { "\($0.usedPercent)%" } ?? "nil"), secondary=\(usage.rateLimit?.secondaryWindow.map { "\($0.usedPercent)%" } ?? "nil")")
-            return buildSnapshot(from: usage)
+            let primaryDescription = usage.rateLimit?.primaryWindow.map {
+                "\($0.usedPercent)%/\($0.limitWindowSeconds)s"
+            } ?? "nil"
+            let secondaryDescription = usage.rateLimit?.secondaryWindow.map {
+                "\($0.usedPercent)%/\($0.limitWindowSeconds)s"
+            } ?? "nil"
+            debugLog(
+                openaiLog,
+                "wham parsed: plan=\(usage.planType ?? "?"), primary=\(primaryDescription), secondary=\(secondaryDescription)"
+            )
+            return OpenAIUsageSnapshotMapper.snapshot(from: usage, generatedAt: Date())
         } catch {
             let fragment = String(data: data.prefix(300), encoding: .utf8) ?? "<binary>"
             debugLog(openaiLog, "wham parse FAILED: \(error.localizedDescription), body=\(fragment)")
             throw OpenAICookiesError.parsingFailed(error.localizedDescription)
         }
-    }
-
-    // MARK: - Snapshot construction
-
-    private func buildSnapshot(from usage: WhamUsageResponse) -> UsageSnapshot {
-        let primary = window(from: usage.rateLimit?.primaryWindow, fallbackHours: 5)
-        let secondary = window(from: usage.rateLimit?.secondaryWindow, fallbackHours: 168)
-        return UsageSnapshot(
-            provider: .codex,
-            generatedAt: Date(),
-            sessionWindow: primary,
-            weeklyWindow: secondary,
-            totalEventsInPeriod: 0
-        )
-    }
-
-    private func window(from snap: WhamUsageResponse.WindowSnapshot?, fallbackHours: Int) -> WindowSnapshot {
-        guard let s = snap else {
-            return WindowSnapshot(durationHours: fallbackHours, tokensUsed: 0, costUSD: 0, percentUsed: nil, resetAt: nil, percentSource: .unknown)
-        }
-        let hours = s.limitWindowSeconds > 0 ? s.limitWindowSeconds / 3600 : fallbackHours
-        // wham/usage reports used_percent as an integer with a floor of 1 — any nonzero
-        // activity (including the rolling 7d window catching old sessions) shows as 1%,
-        // which makes idle users see "99% left". Subtract 1 so the floor reads as 100%.
-        let adjustedUsedPercent = max(0, s.usedPercent - 1)
-        return WindowSnapshot(
-            durationHours: hours,
-            tokensUsed: 0,
-            costUSD: 0,
-            percentUsed: Double(adjustedUsedPercent) / 100.0,
-            resetAt: Date(timeIntervalSince1970: TimeInterval(s.resetAt)),
-            percentSource: .authoritative
-        )
-    }
-
-    private func emptySnapshot() -> UsageSnapshot {
-        let win = WindowSnapshot(durationHours: 5, tokensUsed: 0, costUSD: 0, percentUsed: nil, resetAt: nil, percentSource: .unknown)
-        return UsageSnapshot(
-            provider: .codex,
-            generatedAt: Date(),
-            sessionWindow: win,
-            weeklyWindow: win,
-            totalEventsInPeriod: 0
-        )
     }
 }
