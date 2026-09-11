@@ -43,20 +43,73 @@ private func expiryColor(_ status: String) -> Color {
 // MARK: - Root
 
 struct SettingsView: View {
-    var body: some View {
-        TabView {
-            ProviderVisibilitySettingsTab()
-                .tabItem { Label("Display", systemImage: "eye") }
-            ClaudeSettingsTab()
-                .tabItem { Label("Claude", systemImage: "brain") }
-            OpenAISettingsTab()
-                .tabItem { Label("ChatGPT", systemImage: "bubble.left") }
-            AccountQuotaSettingsTab()
-                .tabItem { Label("Account limits", systemImage: "gauge.with.dots.needle.33percent") }
-            AboutTab()
-                .tabItem { Label("About", systemImage: "info.circle") }
+    private enum Section: String, CaseIterable, Identifiable {
+        case display = "Display"
+        case claude = "Claude"
+        case chatGPT = "ChatGPT"
+        case accountLimits = "Account limits"
+        case about = "About"
+
+        var id: Self { self }
+
+        var symbol: String {
+            switch self {
+            case .display: return "eye"
+            case .claude: return "brain"
+            case .chatGPT: return "bubble.left"
+            case .accountLimits: return "gauge.with.dots.needle.33percent"
+            case .about: return "info.circle"
+            }
         }
-        .frame(width: 480, height: 560)
+    }
+
+    @State private var selection: Section = .display
+
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Settings")
+                    .font(.headline)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 10)
+
+                ForEach(Section.allCases) { section in
+                    Button {
+                        selection = section
+                    } label: {
+                        Label(section.rawValue, systemImage: section.symbol)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 9)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(selection == section ? Color.white : Color.primary)
+                    .background(selection == section ? Color.accentColor : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7))
+                    .accessibilityAddTraits(selection == section ? .isSelected : [])
+                }
+                Spacer()
+            }
+            .padding(12)
+            .frame(width: 176)
+            .frame(maxHeight: .infinity)
+            .background(.thinMaterial)
+
+            Divider()
+
+            Group {
+                switch selection {
+                case .display: ProviderVisibilitySettingsTab()
+                case .claude: ClaudeSettingsTab()
+                case .chatGPT: OpenAISettingsTab()
+                case .accountLimits: AccountQuotaSettingsTab()
+                case .about: AboutTab()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(width: 680, height: 560)
     }
 }
 
