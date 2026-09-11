@@ -36,6 +36,9 @@ final class Aggregator {
             price = Pricing.claudeModels[event.model]
         case .codex:
             price = Pricing.openaiModels[event.model]
+        case .gemini, .kimi, .glm:
+            // Account quotas do not use local token/cost accounting.
+            price = nil
         }
 
         guard let p = price else { return 0 }
@@ -65,6 +68,8 @@ final class Aggregator {
 
             // Reasoning tokens billed at output rate
             total += Double(event.reasoningTokens) * p.outputPerMTok / 1_000_000
+        case .gemini, .kimi, .glm:
+            break
         }
 
         return total

@@ -38,6 +38,15 @@ struct MenuContentView: View {
     @Environment(\.openWindow) private var openWindow
     @AppStorage("display.provider.claude") private var showClaude = true
     @AppStorage("display.provider.openai") private var showOpenAI = true
+    @AppStorage("display.provider.gemini") private var showGemini = false
+    @AppStorage("display.provider.kimi") private var showKimi = false
+    @AppStorage("display.provider.glm") private var showGLM = false
+
+    private var visibleQuotaProviders: [Provider] {
+        [showGemini ? Provider.gemini : nil,
+         showKimi ? Provider.kimi : nil,
+         showGLM ? Provider.glm : nil].compactMap { $0 }
+    }
 
     private let relativeFmt: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
@@ -52,6 +61,27 @@ struct MenuContentView: View {
                 .font(.headline)
                 .padding(.bottom, 8)
 
+            ScrollView {
+                providerSections
+            }
+            .frame(maxHeight: 460)
+
+            Divider().padding(.vertical, 8)
+
+            // ── Footer ──────────────────────────────────────────────────
+            footer
+        }
+        .padding(12)
+        .frame(width: 280)
+        .task {
+            if viewModel.lastRefreshAt == nil {
+                await viewModel.refresh()
+            }
+        }
+    }
+
+    private var providerSections: some View {
+        VStack(alignment: .leading, spacing: 0) {
             if showClaude {
                 // ── Claude primary section ───────────────────────────────
                 providerSection(
@@ -122,27 +152,62 @@ struct MenuContentView: View {
                 }
             }
 
-            if !showClaude && !showOpenAI {
+            ForEach(visibleQuotaProviders, id: \.self) { provider in
+                if showClaude || showOpenAI || provider != visibleQuotaProviders.first {
+                    Divider().padding(.vertical, 8)
+                }
+                accountQuotaSection(provider: provider)
+            }
+
+            if !showClaude && !showOpenAI && visibleQuotaProviders.isEmpty {
                 Text("No providers selected")
                     .font(.caption)
                     .foregroundColor(.secondary)
-            }
-
-            Divider().padding(.vertical, 8)
-
-            // ── Footer ──────────────────────────────────────────────────
-            footer
-        }
-        .padding(12)
-        .frame(width: 280)
-        .task {
-            if viewModel.lastRefreshAt == nil {
-                await viewModel.refresh()
             }
         }
     }
 
     // MARK: - Provider section
+
+    private func accountQuotaSection(provider: Provider) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(provider == .gemini ? "Gemini Code Assist" : provider.displayName, systemImage: provider.symbolName)
+                .font(.subheadline.weight(.semibold))
+            if let snapshot = viewModel.accountQuotas[provider] {
+                ForEach(snapshot.windows) { window in
+                    let freshness = window.freshness(generatedAt: snapshot.generatedAt, now: Date())
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(window.label)
+                                .lineLimit(2)
+                            Spacer()
+                            Text(freshness == .expired ? "ukwn" : "\(Int((window.remainingFraction * 100).rounded()))% left")
+                                .foregroundColor(freshness == .expired ? .secondary : remainingColor(for: window.remainingFraction))
+                        }
+                        .font(.caption)
+                        if freshness != .expired {
+                            ProgressView(value: window.remainingFraction)
+                                .tint(remainingColor(for: window.remainingFraction))
+                        }
+                        if let reset = window.resetAt, reset > Date() {
+                            Text(resetIn(reset)).font(.caption2).foregroundColor(.secondary)
+                        }
+                        if freshness != .fresh {
+                            Text(freshness == .expired ? "Expired — refresh to update" : "Cached — updated \(shortAge(since: snapshot.generatedAt, now: Date()))")
+                                .font(.caption2).foregroundColor(.orange)
+                        }
+                    }
+                }
+            }
+            if let error = viewModel.accountQuotaErrors[provider] {
+                Text(error).font(.caption).foregroundColor(.orange)
+            } else if viewModel.accountQuotas[provider] == nil {
+                Text(AccountQuotaConfiguration.load(provider: provider).enabled
+                     ? "Waiting for account limits…" : "Connect in Settings → Account limits.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+    }
 
     @ViewBuilder
     private func providerSection(
@@ -254,6 +319,7 @@ struct MenuContentView: View {
         switch provider {
         case .claude: return viewModel.claudeCookieExpiresAt
         case .codex:  return viewModel.codexCookieExpiresAt
+        case .gemini, .kimi, .glm: return nil
         }
     }
 
@@ -261,6 +327,7 @@ struct MenuContentView: View {
         switch provider {
         case .claude: return viewModel.claudeSessionExpired
         case .codex:  return viewModel.codexSessionExpired
+        case .gemini, .kimi, .glm: return false
         }
     }
 

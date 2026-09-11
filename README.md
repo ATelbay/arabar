@@ -1,6 +1,6 @@
 # arabar
 
-Menubar-приложение для macOS, показывает % оставшегося лимита Claude и ChatGPT прямо в статусной строке. Три независимых источника данных: CLI JSONL, cookies браузера (opt-in), Admin API key (opt-in).
+Menubar-приложение для macOS, показывает % оставшегося лимита Claude и ChatGPT, а также лимиты аккаунтов Gemini Code Assist, Kimi Code и GLM Coding Plan прямо в статусной строке. Источники: CLI JSONL, cookies браузера (opt-in), Admin API key (opt-in), account quota API (opt-in).
 
 ## Требования
 
@@ -24,7 +24,7 @@ open /Applications/arabar.app
 
 ## Что показывает
 
-В menubar: иконка провайдера + процент **оставшегося** лимита 5-часового окна. Два провайдера (Claude / ChatGPT) чередуются каждые 30 секунд; правый клик / two-finger tap по иконке переключает вручную. Если для активного провайдера нет авторитетного источника (cookies не настроены / 401) — рядом с иконкой `ukwn`.
+В menubar: иконка провайдера + процент **оставшегося** лимита 5-часового окна. Выбранные в Settings → Display провайдеры чередуются каждые 30 секунд; правый клик / two-finger tap по иконке переключает вручную. Если для активного провайдера нет авторитетного источника (cookies не настроены / 401) — рядом с иконкой `ukwn`.
 
 - **Subscription** (Pro/Max/Plus): процент **оставшегося** лимита 5h-окна и 7d-окна. Дропдаун показывает оба окна с прогресс-баром, который тоже инвертирован (бар сжимается по мере расхода).
 - **API tier**: расход pay-as-you-go запросов (отдельный счёт, не пересекается с subscription).
@@ -35,7 +35,7 @@ open /Applications/arabar.app
 ## Источники данных
 
 | Источник | Что даёт | Как включить |
-|---|---|---|
+| --- | --- | --- |
 | **CLI JSONL** | Реальные токены и стоимость из Claude Code / Codex CLI (процент — только если есть cookies) | Работает автоматически если CLI установлен (`~/.claude/projects/`, `~/.codex/sessions/`) |
 | **Browser cookies** | Авторитетный процент оставшегося лимита из claude.ai / chatgpt.com | Opt-in в Settings → таб Claude/ChatGPT → "Use browser session cookies" |
 | **Admin API key** | API-tier usage (pay-as-you-go, отдельный счёт) | Opt-in в Settings → таб Claude/ChatGPT → поле "Admin API key" |
@@ -46,12 +46,37 @@ Subscription-источники **объединяются**: cookies дают �
 
 Открыть: `⌘,` в меню или кнопка "Settings…" в дропдауне.
 
-Три таба: **Claude**, **ChatGPT**, **About**.
+Табы: **Display**, **Claude**, **ChatGPT**, **Account limits**, **About**. В **Display** можно включить Gemini, Kimi и GLM (по умолчанию скрыты).
 
-Каждый таб содержит:
+Табы Claude и ChatGPT содержат:
+
 1. **Subscription cookies** — включить/выключить, выбрать браузер, кнопка "Test connection".
 2. **Admin API key** — ввести ключ, сохраняется в Keychain, кнопка "Test".
 3. **Display source** — что показывать в menubar: subscription или API tier.
+
+## Лимиты аккаунтов Gemini, Kimi и GLM
+
+Откройте **Settings → Account limits**, выберите провайдера и включите **Read account limits**. Провайдер автоматически добавится в menubar; видимость можно изменить в **Display**. **Test connection** проверяет доступ к квотам. По умолчанию подключения выключены.
+
+| Провайдер | Подключение | Что отображается |
+| --- | --- | --- |
+| **Gemini** | Существующий Google login в Gemini CLI (`~/.gemini/oauth_creds.json`); при необходимости Google Cloud project ID | Квоты Code Assist по моделям и время сброса |
+| **Kimi** | Kimi Code API key и регион аккаунта (`kimi.ai` / `kimi.com`) | Недельная и другие квоты, возвращённые Kimi Code |
+| **GLM** | GLM Coding Plan API key и регион Z.ai / Zhipu | Окна квот coding plan и tools, возвращённые провайдером |
+
+Menubar показывает **оставшийся процент самой ограниченной из возвращённых квот**. Дропдаун показывает каждую квоту отдельно и время сброса. Если хотя бы одна ранее полученная квота истекла, общий процент становится `ukwn`; старые данные не выдаются за актуальные. TTL: fresh ≤2 минуты, stale ≤30 минут, затем процент скрывается; наступивший reset также скрывает процент до следующего успешного запроса. Ошибки подключения видны рядом с провайдером.
+
+Для этих трёх провайдеров локальные сессии, токены и стоимость не используются. Gemini показывает **Code Assist / CLI quotas**, а не лимиты чата gemini.google.com; Gemini API keys для этого подключения не подходят. Отдельная месячная квота членства Kimi может не возвращаться Kimi Code API и не вычисляется из локальных логов. Отсутствующие окна не придумываются.
+
+Ключи Kimi/GLM хранятся в Keychain приложения. Gemini читает только файл авторизации CLI, находит публичную OAuth-конфигурацию в установленном Gemini CLI (npm/Homebrew), обновляет access token через Google и держит его в памяти, не меняя файл CLI. Если используется только зашифрованное хранилище Gemini без `oauth_creds.json`, приложение сообщает, что подключение недоступно. Credentials не логируются.
+
+Источники и контракты:
+
+- [Gemini CLI quota API](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/server.ts), [schema](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/types.ts), [Google OAuth](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts).
+- [Kimi Code quota reader](https://github.com/MoonshotAI/kimi-code/blob/main/packages/oauth/src/managed-usage.ts), [Kimi quota documentation](https://www.kimi.com/code/docs/en/kimi-code/membership.html).
+- [Z.ai official quota plugin](https://github.com/zai-org/zai-coding-plugins/blob/main/plugins/glm-plan-usage/skills/usage-query-skill/scripts/query-usage.mjs), [plugin documentation](https://docs.z.ai/devpack/extension/usage-query-plugin).
+
+Это внутренние quota endpoints провайдеров: схема или доступ могут измениться. Проверены сборка, разбор ответов и HTTP/auth поведение на изолированных fixtures; живое подключение к платным аккаунтам проверяется через **Test connection**.
 
 ## Cookies (opt-in)
 
@@ -79,6 +104,7 @@ Enable cookies-reader debug logs: `defaults write com.arystantelbay.arabar debug
 - **CLI JSONL** — только локальные файлы (`~/.claude/projects/`, `~/.codex/sessions/`). Сеть не используется.
 - **Cookies** — opt-in. Используются только для запросов к `claude.ai` и `chatgpt.com`. Маскируются в логах, никуда не передаются третьим сторонам.
 - **Admin API keys** — хранятся в Keychain нашего приложения. Никогда не логируются. Используются только для запросов к `api.anthropic.com` и `api.openai.com`.
+- **Account limits** — opt-in. Запросы только к `cloudcode-pa.googleapis.com` / `oauth2.googleapis.com` (Gemini), `api.kimi.ai` / `api.kimi.com` (Kimi), `api.z.ai` / `open.bigmodel.cn` (GLM), в зависимости от выбранного подключения.
 - Публичные Statuspage JSON (`status.anthropic.com`, `status.openai.com`) — единственные внешние запросы без credentials.
 
 ## Login at startup

@@ -7,6 +7,26 @@ final class AppViewModel: ObservableObject {
     // MARK: - Primary snapshots (shown in menubar & main section)
     @Published var claudeSnapshot: UsageSnapshot?       // subscription source (cookies or JSONL); overridden to api if display.source.claude == "api"
     @Published var codexSnapshot: UsageSnapshot?        // same for codex
+    @Published var accountQuotas: [Provider: AccountQuotaSnapshot] = [:]
+    @Published var accountQuotaErrors: [Provider: String] = [:]
+    private let accountQuotaReader = AccountQuotaReader()
+    private var quotaConfigurations: [Provider: AccountQuotaConfiguration] = [:]
+
+    func snapshot(for provider: Provider) -> UsageSnapshot? {
+        switch provider {
+        case .claude: return claudeSnapshot
+        case .codex: return codexSnapshot
+        case .gemini, .kimi, .glm: return nil
+        }
+    }
+
+    func status(for provider: Provider) -> StatusInfo? {
+        switch provider {
+        case .claude: return claudeStatus
+        case .codex: return codexStatus
+        case .gemini, .kimi, .glm: return nil
+        }
+    }
 
     // MARK: - API-tier snapshots (separate section if user configured both)
     @Published var claudeApiSnapshot: UsageSnapshot?    // Admin API key
@@ -93,6 +113,14 @@ final class AppViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
             .sink { [weak self] _ in
                 guard let self else { return }
+                for provider in Provider.accountQuotaProviders {
+                    let configuration = AccountQuotaConfiguration.load(provider: provider)
+                    if self.quotaConfigurations[provider] != configuration {
+                        self.accountQuotas[provider] = nil
+                        self.accountQuotaErrors[provider] = nil
+                        self.quotaConfigurations[provider] = configuration
+                    }
+                }
                 let cookiesClaudeOn = UserDefaults.standard.bool(forKey: "cookies.enabled.claude")
                 let cookiesOpenAIOn = UserDefaults.standard.bool(forKey: "cookies.enabled.openai")
                 let claudeSource = UserDefaults.standard.string(forKey: "cookies.source.claude") ?? "safari"
@@ -133,12 +161,14 @@ final class AppViewModel: ObservableObject {
         async let codexApiTask   = computeAPISnapshot(provider: .codex,  now: now)
         async let claudeStatTask = StatusPagePoller.fetch(provider: .claude)
         async let codexStatTask  = StatusPagePoller.fetch(provider: .codex)
+        async let accountQuotaTask = refreshAccountQuotas()
 
         let claudeSubResult = await claudeSubTask
         let codexSubResult = await codexSubTask
         let claudeApiResult = await claudeApiTask
         let codexApiResult = await codexApiTask
-        let usageResults = [claudeSubResult, codexSubResult, claudeApiResult, codexApiResult]
+        let quotaResult = await accountQuotaTask
+        let usageResults = [claudeSubResult, codexSubResult, claudeApiResult, codexApiResult, quotaResult]
 
         if settingsRevision != revisionAtStart {
             // Cookie settings changed while this refresh was in flight. Do not let
@@ -221,6 +251,9 @@ final class AppViewModel: ObservableObject {
     // MARK: - Subscription source: cookies → JSONL fallback
 
     private func computeSubscriptionSnapshot(provider: Provider, now: Date) async -> SnapshotRefreshResult {
+        guard !provider.usesAccountQuota else {
+            return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
+        }
         let cookiesKey = provider == .claude ? "cookies.enabled.claude" : "cookies.enabled.openai"
         if UserDefaults.standard.bool(forKey: cookiesKey) {
             // Kick off JSONL in parallel — it's cheap (in-memory buffer after first load)
@@ -232,6 +265,8 @@ final class AppViewModel: ObservableObject {
                     cookiesSnap = try await claudeCookieReader.fetchSnapshot()
                 case .codex:
                     cookiesSnap = try await openaiCookieReader.fetchSnapshot()
+                case .gemini, .kimi, .glm:
+                    return SnapshotRefreshResult(snapshot: await jsonlTask, didRefreshSource: false, didFailSource: false)
                 }
                 let jsonlSnap = await jsonlTask
                 return SnapshotRefreshResult(
@@ -301,6 +336,8 @@ final class AppViewModel: ObservableObject {
                 events = try await AnthropicAdminAPIReader().fetchEvents(lookbackDays: 30)
             case .codex:
                 events = try await OpenAIUsageAPIReader().fetchEvents(lookbackDays: 30)
+            case .gemini, .kimi, .glm:
+                return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
             }
             let snapshots = aggregator.aggregate(events: events, now: now)
             return SnapshotRefreshResult(
@@ -324,6 +361,35 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - JSONL per-provider snapshot
 
+    private func refreshAccountQuotas() async -> SnapshotRefreshResult {
+        var didRefresh = false
+        var didFail = false
+        for provider in Provider.accountQuotaProviders {
+            let configuration = AccountQuotaConfiguration.load(provider: provider)
+            if quotaConfigurations[provider] != configuration {
+                accountQuotas[provider] = nil
+                accountQuotaErrors[provider] = nil
+                quotaConfigurations[provider] = configuration
+            }
+            guard configuration.enabled else { continue }
+            do {
+                let snapshot = try await accountQuotaReader.fetch(configuration: configuration)
+                guard AccountQuotaConfiguration.load(provider: provider) == configuration else { continue }
+                accountQuotas[provider] = snapshot
+                accountQuotaErrors[provider] = nil
+                didRefresh = true
+            } catch {
+                guard AccountQuotaConfiguration.load(provider: provider) == configuration else { continue }
+                accountQuotaErrors[provider] = error.localizedDescription
+                if (error as? AccountQuotaError)?.invalidatesSnapshot == true {
+                    accountQuotas[provider] = nil
+                }
+                didFail = true
+            }
+        }
+        return SnapshotRefreshResult(snapshot: nil, didRefreshSource: didRefresh, didFailSource: didFail)
+    }
+
     private func jsonlSnapshot(for provider: Provider, now: Date) async -> UsageSnapshot? {
         guard isBufferLoaded else { return nil }
         let needsRebuild = eventBuffer.isEmpty && !initialRebuildDone.contains(provider)
@@ -342,6 +408,8 @@ final class AppViewModel: ObservableObject {
                 newEvents = try await Task.detached(priority: .userInitiated) {
                     needsRebuild ? try reader.rebuildAll() : try reader.fetchNewEvents()
                 }.value
+            case .gemini, .kimi, .glm:
+                return nil
             }
         } catch {
             self.lastError = "\(provider) JSONL: \(error.localizedDescription)"

@@ -51,6 +51,8 @@ struct SettingsView: View {
                 .tabItem { Label("Claude", systemImage: "brain") }
             OpenAISettingsTab()
                 .tabItem { Label("ChatGPT", systemImage: "bubble.left") }
+            AccountQuotaSettingsTab()
+                .tabItem { Label("Account limits", systemImage: "gauge.with.dots.needle.33percent") }
             AboutTab()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
@@ -63,17 +65,28 @@ struct SettingsView: View {
 private struct ProviderVisibilitySettingsTab: View {
     @AppStorage("display.provider.claude") private var showClaude = true
     @AppStorage("display.provider.openai") private var showOpenAI = true
+    @AppStorage("display.provider.gemini") private var showGemini = false
+    @AppStorage("display.provider.kimi") private var showKimi = false
+    @AppStorage("display.provider.glm") private var showGLM = false
 
     var body: some View {
         Form {
             Section {
                 Toggle("Claude Code", isOn: $showClaude)
                 Toggle("ChatGPT / Codex", isOn: $showOpenAI)
+                Toggle("Gemini", isOn: $showGemini)
+                Toggle("Kimi", isOn: $showKimi)
+                Toggle("GLM (Z.ai)", isOn: $showGLM)
             } header: {
                 Text("Providers shown")
             } footer: {
                 Text("Hidden providers stay configured and can be added back at any time.")
             }
+            Section {
+                Text("Connect Gemini, Kimi, and GLM in the Account limits tab. Their percentages come directly from the provider.")
+                    .foregroundColor(.secondary)
+            }
+
         }
         .formStyle(.grouped)
         .padding()
@@ -331,7 +344,7 @@ struct AboutTab: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
 
-            Text("Menubar usage monitor for Claude and ChatGPT.")
+            Text("Menubar usage monitor for Claude, ChatGPT, Gemini, Kimi, and GLM.")
                 .font(.body)
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
