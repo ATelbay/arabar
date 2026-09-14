@@ -20,12 +20,14 @@ enum StatusPagePoller {
 
     // MARK: - URL mapping
 
-    private static func statusURL(for provider: Provider) -> URL {
+    private static func statusURL(for provider: Provider) -> URL? {
         switch provider {
         case .claude:
             return URL(string: "https://status.anthropic.com/api/v2/status.json")!
         case .codex:
             return URL(string: "https://status.openai.com/api/v2/status.json")!
+        case .gemini, .kimi, .glm:
+            return nil
         }
     }
 
@@ -45,7 +47,9 @@ enum StatusPagePoller {
 
     static func fetch(provider: Provider) async -> StatusInfo {
         let now = Date()
-        let url = statusURL(for: provider)
+        guard let url = statusURL(for: provider) else {
+            return StatusInfo(provider: provider, level: .unknown, summary: nil, incidentURL: nil, fetchedAt: now)
+        }
 
         var request = URLRequest(url: url, timeoutInterval: 10)
         request.httpMethod = "GET"

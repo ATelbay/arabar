@@ -21,12 +21,18 @@ struct MenuBarLabel: View {
     @ObservedObject var viewModel: AppViewModel
     @AppStorage("display.provider.claude") private var showClaude = true
     @AppStorage("display.provider.openai") private var showOpenAI = true
+    @AppStorage("display.provider.gemini") private var showGemini = false
+    @AppStorage("display.provider.kimi") private var showKimi = false
+    @AppStorage("display.provider.glm") private var showGLM = false
 
     private var providers: [Provider] {
         Provider.allCases.filter { provider in
             switch provider {
             case .claude: return showClaude
             case .codex: return showOpenAI
+            case .gemini: return showGemini
+            case .kimi: return showKimi
+            case .glm: return showGLM
             }
         }
     }
@@ -52,8 +58,8 @@ struct MenuBarLabel: View {
 
     @ViewBuilder
     private func providerChip(provider: Provider) -> some View {
-        let snap = (provider == .claude) ? viewModel.claudeSnapshot : viewModel.codexSnapshot
-        let status = (provider == .claude) ? viewModel.claudeStatus : viewModel.codexStatus
+        let snap = viewModel.snapshot(for: provider)
+        let status = viewModel.status(for: provider)
         let now = Date()
         let window = snap.flatMap { MenuBarDisplayPolicy.preferredWindow(in: $0, now: now) }
         let isExpired = window.map { selectedWindow in
@@ -72,15 +78,30 @@ struct MenuBarLabel: View {
                     .font(.system(size: 9))
                     .foregroundColor(.orange)
             }
-            logoImage(named: logoName, size: 11)
-            if !isExpired, let percentUsed = window?.percentUsed {
-                let remaining = 1.0 - percentUsed
-                Text("\(Int((remaining * 100).rounded()))%")
-                    .foregroundColor(color(for: remaining))
+            if provider.usesAccountQuota {
+                Image(systemName: provider.symbolName)
+                    .font(.system(size: 11))
+                Text(provider.displayName)
+                if let remaining = viewModel.accountQuotas[provider]?.remainingFraction(now: now) {
+                    Text("\(Int((remaining * 100).rounded()))%")
+                        .foregroundColor(color(for: remaining))
+                        .help("Remaining in the most constrained reported quota. Open the menu for all limits.")
+                } else {
+                    Text("ukwn")
+                        .foregroundColor(.secondary)
+                        .help(viewModel.accountQuotaErrors[provider] ?? "Connect your account in Settings → Account limits.")
+                }
             } else {
-                Text("ukwn")
-                    .foregroundColor(.secondary)
-                    .help(isExpired ? "Cached usage data expired. Refresh to update." : "Subscription limit unknown — enable browser cookies in Settings for an accurate %.")
+                logoImage(named: logoName, size: 11)
+                if !isExpired, let percentUsed = window?.percentUsed {
+                    let remaining = 1.0 - percentUsed
+                    Text("\(Int((remaining * 100).rounded()))%")
+                        .foregroundColor(color(for: remaining))
+                } else {
+                    Text("ukwn")
+                        .foregroundColor(.secondary)
+                        .help(isExpired ? "Cached usage data expired. Refresh to update." : "Subscription limit unknown — enable browser cookies in Settings for an accurate %.")
+                }
             }
         }
         .transition(.opacity)

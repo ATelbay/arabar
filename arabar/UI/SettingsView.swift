@@ -43,18 +43,73 @@ private func expiryColor(_ status: String) -> Color {
 // MARK: - Root
 
 struct SettingsView: View {
-    var body: some View {
-        TabView {
-            ProviderVisibilitySettingsTab()
-                .tabItem { Label("Display", systemImage: "eye") }
-            ClaudeSettingsTab()
-                .tabItem { Label("Claude", systemImage: "brain") }
-            OpenAISettingsTab()
-                .tabItem { Label("ChatGPT", systemImage: "bubble.left") }
-            AboutTab()
-                .tabItem { Label("About", systemImage: "info.circle") }
+    private enum Section: String, CaseIterable, Identifiable {
+        case display = "Display"
+        case claude = "Claude"
+        case chatGPT = "ChatGPT"
+        case accountLimits = "Account limits"
+        case about = "About"
+
+        var id: Self { self }
+
+        var symbol: String {
+            switch self {
+            case .display: return "eye"
+            case .claude: return "brain"
+            case .chatGPT: return "bubble.left"
+            case .accountLimits: return "gauge.with.dots.needle.33percent"
+            case .about: return "info.circle"
+            }
         }
-        .frame(width: 480, height: 560)
+    }
+
+    @State private var selection: Section = .display
+
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Settings")
+                    .font(.headline)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 10)
+
+                ForEach(Section.allCases) { section in
+                    Button {
+                        selection = section
+                    } label: {
+                        Label(section.rawValue, systemImage: section.symbol)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 9)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(selection == section ? Color.white : Color.primary)
+                    .background(selection == section ? Color.accentColor : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7))
+                    .accessibilityAddTraits(selection == section ? .isSelected : [])
+                }
+                Spacer()
+            }
+            .padding(12)
+            .frame(width: 176)
+            .frame(maxHeight: .infinity)
+            .background(.thinMaterial)
+
+            Divider()
+
+            Group {
+                switch selection {
+                case .display: ProviderVisibilitySettingsTab()
+                case .claude: ClaudeSettingsTab()
+                case .chatGPT: OpenAISettingsTab()
+                case .accountLimits: AccountQuotaSettingsTab()
+                case .about: AboutTab()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(width: 680, height: 560)
     }
 }
 
@@ -63,17 +118,28 @@ struct SettingsView: View {
 private struct ProviderVisibilitySettingsTab: View {
     @AppStorage("display.provider.claude") private var showClaude = true
     @AppStorage("display.provider.openai") private var showOpenAI = true
+    @AppStorage("display.provider.gemini") private var showGemini = false
+    @AppStorage("display.provider.kimi") private var showKimi = false
+    @AppStorage("display.provider.glm") private var showGLM = false
 
     var body: some View {
         Form {
             Section {
                 Toggle("Claude Code", isOn: $showClaude)
                 Toggle("ChatGPT / Codex", isOn: $showOpenAI)
+                Toggle("Gemini", isOn: $showGemini)
+                Toggle("Kimi", isOn: $showKimi)
+                Toggle("GLM (Z.ai)", isOn: $showGLM)
             } header: {
                 Text("Providers shown")
             } footer: {
                 Text("Hidden providers stay configured and can be added back at any time.")
             }
+            Section {
+                Text("Connect Gemini, Kimi, and GLM in the Account limits tab. Their percentages come directly from the provider.")
+                    .foregroundColor(.secondary)
+            }
+
         }
         .formStyle(.grouped)
         .padding()
@@ -331,7 +397,7 @@ struct AboutTab: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
 
-            Text("Menubar usage monitor for Claude and ChatGPT.")
+            Text("Menubar usage monitor for Claude, ChatGPT, Gemini, Kimi, and GLM.")
                 .font(.body)
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
