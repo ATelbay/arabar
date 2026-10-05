@@ -24,12 +24,77 @@ enum Pricing {
         let outputPerMTok: Double
     }
 
+    static func claudePrice(for model: String) -> ModelPrice? {
+        if let price = claudeModels[model] { return price }
+        // Anthropic snapshot IDs append an eight-digit release date.
+        guard let separator = model.lastIndex(of: "-") else { return nil }
+        let suffix = model[model.index(after: separator)...]
+        guard suffix.count == 8, suffix.allSatisfy(\.isNumber) else { return nil }
+        return claudeModels[String(model[..<separator])]
+    }
+
+    static func openAIPrice(for model: String) -> ModelPrice? {
+        // API model IDs use dotted versions; retain the historical table keys.
+        openaiModels[model] ?? openaiModels[model.replacingOccurrences(of: ".", with: "-")]
+    }
+
     // MARK: - Anthropic Claude Models
     // Source: platform.claude.com/docs/en/about-claude/pricing, confirmed May 2026.
     // Cache multipliers: write-5m = 1.25x input, write-1h = 2x input, cache read = 0.1x input.
     static let claudeModels: [String: ModelPrice] = [
 
-        // Claude Opus 4.7 — current flagship (new tokenizer: up to 35% more tokens vs older models)
+        // Claude 5 family — first-party API rates (claude-api reference, cached 2026-06-24).
+        // Cache writes follow the standard 1.25x / 2x multipliers; cache reads use the
+        // published per-model rate where it deviates from 0.1x.
+        "claude-fable-5-1": .init(
+            inputPerMTok:        10.00,
+            cachedInputPerMTok:  0.25,
+            cacheWrite5mPerMTok: 12.50,
+            cacheWrite1hPerMTok: 20.00,
+            outputPerMTok:       50.00
+        ),
+
+        "claude-fable-5": .init(
+            inputPerMTok:        10.00,
+            cachedInputPerMTok:  1.00,
+            cacheWrite5mPerMTok: 12.50,
+            cacheWrite1hPerMTok: 20.00,
+            outputPerMTok:       50.00
+        ),
+
+        "claude-opus-5-5": .init(
+            inputPerMTok:        4.00,
+            cachedInputPerMTok:  0.20,
+            cacheWrite5mPerMTok: 5.00,
+            cacheWrite1hPerMTok: 8.00,
+            outputPerMTok:       20.00
+        ),
+
+        "claude-opus-5": .init(
+            inputPerMTok:        5.00,
+            cachedInputPerMTok:  0.50,
+            cacheWrite5mPerMTok: 6.25,
+            cacheWrite1hPerMTok: 10.00,
+            outputPerMTok:       25.00
+        ),
+
+        "claude-sonnet-5": .init(
+            inputPerMTok:        2.00,
+            cachedInputPerMTok:  0.20,
+            cacheWrite5mPerMTok: 2.50,
+            cacheWrite1hPerMTok: 4.00,
+            outputPerMTok:       10.00
+        ),
+
+        "claude-opus-4-8": .init(
+            inputPerMTok:        5.00,
+            cachedInputPerMTok:  0.50,
+            cacheWrite5mPerMTok: 6.25,
+            cacheWrite1hPerMTok: 10.00,
+            outputPerMTok:       25.00
+        ),
+
+        // Claude Opus 4.7 (new tokenizer: up to 35% more tokens vs older models)
         "claude-opus-4-7": .init(
             inputPerMTok:        5.00,
             cachedInputPerMTok:  0.50,
@@ -258,6 +323,40 @@ enum Pricing {
             cacheWrite5mPerMTok: nil,
             cacheWrite1hPerMTok: nil,
             outputPerMTok:       14.00
+        ),
+
+        // GPT-5.1 / GPT-5 Codex tier — seen in local Codex CLI sessions
+        "gpt-5-1": .init(
+            inputPerMTok:        1.25,
+            cachedInputPerMTok:  0.125,
+            cacheWrite5mPerMTok: nil,
+            cacheWrite1hPerMTok: nil,
+            outputPerMTok:       10.00
+        ),
+
+        "gpt-5-1-codex": .init(
+            inputPerMTok:        1.25,
+            cachedInputPerMTok:  0.125,
+            cacheWrite5mPerMTok: nil,
+            cacheWrite1hPerMTok: nil,
+            outputPerMTok:       10.00
+        ),
+
+        "gpt-5-codex": .init(
+            inputPerMTok:        1.25,
+            cachedInputPerMTok:  0.125,
+            cacheWrite5mPerMTok: nil,
+            cacheWrite1hPerMTok: nil,
+            outputPerMTok:       10.00
+        ),
+
+        // GPT-5.1-Codex-Mini — same tier as gpt-5-mini
+        "gpt-5-1-codex-mini": .init(
+            inputPerMTok:        0.25,
+            cachedInputPerMTok:  0.025,
+            cacheWrite5mPerMTok: nil,
+            cacheWrite1hPerMTok: nil,
+            outputPerMTok:       2.00
         ),
     ]
 }

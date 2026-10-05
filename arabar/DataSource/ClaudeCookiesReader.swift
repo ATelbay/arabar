@@ -10,16 +10,46 @@ enum BrowserSource: String, Codable, CaseIterable {
     case safari, chrome, brave, edge
 }
 
-enum ClaudeCookiesError: Error {
+enum ClaudeCookiesError: Error, LocalizedError {
     case cookiesNotFound
     case browserUnsupported
     case decryptionFailed
     case accessDenied
     case httpError(Int)
+    /// Rejected by the edge (Cloudflare challenge / bot protection), not by the session.
+    /// Re-logging in does not help, so this must not be reported as an expired session.
+    case blockedByEdge(Int)
     case parsingFailed(String)
     case disabled
     case appBoundEncryption
     case keychainAccessDenied
+
+    var errorDescription: String? {
+        switch self {
+        case .cookiesNotFound: return "No claude.ai session cookie found in the selected browser"
+        case .browserUnsupported: return "Selected browser is not supported"
+        case .decryptionFailed: return "Could not decrypt the browser cookie"
+        case .accessDenied: return "Full Disk Access is required to read browser cookies"
+        case .httpError(let code): return "claude.ai returned HTTP \(code)"
+        case .blockedByEdge(let code): return "claude.ai blocked the request (HTTP \(code), bot protection) — try again later"
+        case .parsingFailed(let detail): return "Unexpected claude.ai response: \(detail)"
+        case .disabled: return "Browser cookies are disabled"
+        case .appBoundEncryption: return "Chrome App-Bound Encryption cookies are not supported"
+        case .keychainAccessDenied: return "Keychain access to the browser's Safe Storage key was denied"
+        }
+    }
+
+    /// 403 from claude.ai means either a dead session (JSON permission error) or an edge
+    /// challenge (HTML page, `cf-mitigated` header). Only the former needs a re-login.
+    static func forHTTPFailure(_ response: HTTPURLResponse) -> ClaudeCookiesError {
+        let contentType = response.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        let isEdgeChallenge = response.value(forHTTPHeaderField: "cf-mitigated") != nil
+            || contentType.contains("text/html")
+        if response.statusCode == 403, isEdgeChallenge {
+            return .blockedByEdge(response.statusCode)
+        }
+        return .httpError(response.statusCode)
+    }
 }
 
 // MARK: - ClaudeCookiesReader
@@ -30,6 +60,7 @@ final class ClaudeCookiesReader {
 
     private static let claudeDomain = "claude.ai"
     private static let sessionCookieName = "sessionKey"
+    private static let lastActiveOrgCookieName = "lastActiveOrg"
     private static let baseURL = "https://claude.ai/api"
     private static let userDefaultsEnabledKey = "cookies.enabled.claude"
     private static let userDefaultsSourceKey = "cookies.source.claude"
@@ -56,8 +87,9 @@ final class ClaudeCookiesReader {
             rawValue: UserDefaults.standard.string(forKey: Self.userDefaultsSourceKey) ?? ""
         ) ?? .safari
 
-        let sessionKey = try extractSessionKey(from: source)
-        let orgId = try await fetchOrgId(sessionKey: sessionKey)
+        let browserSession = try extractSession(from: source)
+        let sessionKey = browserSession.sessionKey
+        let orgId = try await fetchOrgId(sessionKey: sessionKey, preferredOrgId: browserSession.lastActiveOrgId)
         let snapshot = try await fetchUsage(orgId: orgId, sessionKey: sessionKey)
         return snapshot
     }
@@ -72,8 +104,9 @@ final class ClaudeCookiesReader {
         ) ?? .safari
 
         do {
-            let sessionKey = try extractSessionKey(from: source)
-            let orgId = try await fetchOrgId(sessionKey: sessionKey)
+            let browserSession = try extractSession(from: source)
+            let sessionKey = browserSession.sessionKey
+            let orgId = try await fetchOrgId(sessionKey: sessionKey, preferredOrgId: browserSession.lastActiveOrgId)
             if let email = await fetchAccountEmail(orgId: orgId, sessionKey: sessionKey) {
                 return "Logged in as \(email)"
             }
@@ -90,6 +123,8 @@ final class ClaudeCookiesReader {
             return "Chrome App-Bound Encryption (v20) cookies not supported — try Safari or Chrome v126-"
         } catch ClaudeCookiesError.accessDenied {
             return "Error: Grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access"
+        } catch ClaudeCookiesError.blockedByEdge(let code) {
+            return "Error: HTTP \(code) — claude.ai bot protection blocked the request; try again later"
         } catch ClaudeCookiesError.httpError(let code) {
             return "Error: HTTP \(code) — session may have expired"
         } catch ClaudeCookiesError.parsingFailed(let msg) {
@@ -122,16 +157,26 @@ final class ClaudeCookiesReader {
         }
     }
 
-    private func extractSessionKey(from source: BrowserSource) throws -> String {
+    /// Session cookie plus the org the user last had open in the browser (`lastActiveOrg`),
+    /// so multi-org accounts report the same organization's limits as claude.ai does.
+    private struct BrowserSession {
+        let sessionKey: String
+        let lastActiveOrgId: String?
+    }
+
+    private func extractSession(from source: BrowserSource) throws -> BrowserSession {
         switch source {
         case .safari:
             let cookies = try mapSafariError {
                 try SafariBinaryCookies.readCookies(matching: ["claude.ai"])
             }
-            guard let sessionCookie = cookies.first(where: { $0.name == Self.sessionCookieName }) else {
+            let now = Date()
+            let live = cookies.filter { !$0.value.isEmpty && ($0.expiry == nil || $0.expiry! > now) }
+            guard let sessionCookie = live.first(where: { $0.name == Self.sessionCookieName }) else {
                 throw ClaudeCookiesError.cookiesNotFound
             }
-            return sessionCookie.value
+            let org = live.first(where: { $0.name == Self.lastActiveOrgCookieName })?.value
+            return BrowserSession(sessionKey: sessionCookie.value, lastActiveOrgId: org)
         case .chrome:
             return try extractFromProfiles(
                 paths: chromeCookiesPaths(),
@@ -177,7 +222,7 @@ final class ClaudeCookiesReader {
         paths: [String],
         safeStorageService: String,
         safeStorageAccount: String
-    ) throws -> String {
+    ) throws -> BrowserSession {
         guard !paths.isEmpty else { throw ClaudeCookiesError.cookiesNotFound }
         var lastError: Error = ClaudeCookiesError.cookiesNotFound
         for path in paths {
@@ -188,12 +233,10 @@ final class ClaudeCookiesReader {
                     safeStorageAccount: safeStorageAccount
                 )
                 return value
-            } catch ClaudeCookiesError.cookiesNotFound {
-                lastError = ClaudeCookiesError.cookiesNotFound
-                continue
             } catch {
-                // Propagate decryption / app-bound errors immediately
-                throw error
+                // A broken or stale profile must not hide a usable session in another profile.
+                if case ClaudeCookiesError.cookiesNotFound = error { continue }
+                lastError = error
             }
         }
         throw lastError
@@ -201,25 +244,20 @@ final class ClaudeCookiesReader {
 
     // MARK: - Chrome / Chromium Cookie Decryption
 
-    /// Reads the Chromium-family SQLite cookies DB and returns the `sessionKey` value for claude.ai.
+    /// Reads the Chromium-family SQLite cookies DB and returns the `sessionKey` value for claude.ai,
+    /// plus `lastActiveOrg` when it can be read (best-effort, never fails the session read).
     private func extractChromeSessionKey(
         dbPath: String,
         safeStorageService: String,
         safeStorageAccount: String
-    ) throws -> String {
+    ) throws -> BrowserSession {
         guard FileManager.default.fileExists(atPath: dbPath) else {
             throw ClaudeCookiesError.cookiesNotFound
         }
 
         let tmpURL: URL
         do {
-            // Copy DB to temp — Chrome may lock the file
-            tmpURL = try {
-                let url = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("arabar_\(UUID().uuidString).db")
-                try FileManager.default.copyItem(at: URL(fileURLWithPath: dbPath), to: url)
-                return url
-            }()
+            tmpURL = try ChromiumCookieDB.snapshotToTemp(dbPath)
         } catch {
             throw ClaudeCookiesError.cookiesNotFound
         }
@@ -227,6 +265,7 @@ final class ClaudeCookiesReader {
 
         var db: OpaquePointer?
         guard sqlite3_open_v2(tmpURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db)
             throw ClaudeCookiesError.cookiesNotFound
         }
         defer { sqlite3_close(db) }
@@ -235,39 +274,37 @@ final class ClaudeCookiesReader {
         let hasHashPrefix = dbVersion >= 24
         debugLog(claudeLog, "DB meta version=\(dbVersion), hasHashPrefix=\(hasHashPrefix ? "YES" : "NO")")
 
-        let sql = "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE ?1 AND name = ?2 LIMIT 1;"
-
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw ClaudeCookiesError.parsingFailed("SQLite prepare failed")
-        }
-        defer { sqlite3_finalize(stmt) }
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        let likePattern = "%" + Self.claudeDomain + "%"
-        sqlite3_bind_text(stmt, 1, likePattern, -1, transient)
-        sqlite3_bind_text(stmt, 2, Self.sessionCookieName, -1, transient)
-
-        var plainValue: String?
-        var encryptedData: Data?
-
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            if let raw = sqlite3_column_text(stmt, 1) {
-                let val = String(cString: raw)
-                if !val.isEmpty { plainValue = val }
-            }
-            let blobLen = sqlite3_column_bytes(stmt, 2)
-            if blobLen > 0, let blobPtr = sqlite3_column_blob(stmt, 2) {
-                encryptedData = Data(bytes: blobPtr, count: Int(blobLen))
-            }
-        }
+        let (plainValue, encryptedData) = try readCookieRow(db: db!, name: Self.sessionCookieName)
 
         // Row not found at all → not found
         if plainValue == nil && encryptedData == nil {
             throw ClaudeCookiesError.cookiesNotFound
         }
 
+        // Keys are derived lazily and at most once per DB, shared by both cookies.
+        var derivedKeys: [Data]?
+        func aesKeysOrThrow() throws -> [Data] {
+            if let derivedKeys { return derivedKeys }
+            let passwordCandidates = ChromiumKeychain.readAllCandidateKeys(service: safeStorageService, account: safeStorageAccount)
+            guard !passwordCandidates.isEmpty else { throw ClaudeCookiesError.keychainAccessDenied }
+            let keys = passwordCandidates.compactMap { ChromiumKeychain.deriveAESKey(from: $0) }
+            debugLog(claudeLog, "keychain candidates: \(keys.count)")
+            guard !keys.isEmpty else { throw ClaudeCookiesError.decryptionFailed }
+            derivedKeys = keys
+            return keys
+        }
+
+        func lastActiveOrg() -> String? {
+            guard let (plain, encrypted) = try? readCookieRow(db: db!, name: Self.lastActiveOrgCookieName) else { return nil }
+            if let plain, !plain.isEmpty { return plain }
+            guard let encrypted, !encrypted.isEmpty, let keys = try? aesKeysOrThrow() else { return nil }
+            return keys.lazy.compactMap {
+                try? ChromiumCookieDB.decryptChromeCookieBlob(encrypted, key: $0, hasHashPrefix: hasHashPrefix)
+            }.first { UUID(uuidString: $0) != nil }
+        }
+
         if let plain = plainValue, !plain.isEmpty {
-            return plain
+            return BrowserSession(sessionKey: plain, lastActiveOrgId: lastActiveOrg())
         }
 
         guard let encrypted = encryptedData, !encrypted.isEmpty else {
@@ -284,21 +321,13 @@ final class ClaudeCookiesReader {
         let prefix3 = String(data: encrypted.prefix(3), encoding: .utf8) ?? "??"
         debugLog(claudeLog, "cookie blob: \(encrypted.count) bytes, prefix=\(prefix3), profile=\(dbPath)")
 
-        let passwordCandidates = ChromiumKeychain.readAllCandidateKeys(service: safeStorageService, account: safeStorageAccount)
-        guard !passwordCandidates.isEmpty else { throw ClaudeCookiesError.keychainAccessDenied }
-        let pwLens = passwordCandidates.map { $0.count }.map(String.init).joined(separator: ",")
-        debugLog(claudeLog, "password candidates: \(passwordCandidates.count), pwlens=[\(pwLens)]")
-        let aesKeys = passwordCandidates.compactMap { ChromiumKeychain.deriveAESKey(from: $0) }
-        let keylens = aesKeys.map { $0.count }.map(String.init).joined(separator: ",")
-        debugLog(claudeLog, "keychain candidates: \(aesKeys.count), keylens=[\(keylens)]")
-        guard !aesKeys.isEmpty else { throw ClaudeCookiesError.decryptionFailed }
+        let aesKeys = try aesKeysOrThrow()
         for (idx, key) in aesKeys.enumerated() {
             do {
                 let decrypted = try ChromiumCookieDB.decryptChromeCookieBlob(encrypted, key: key, hasHashPrefix: hasHashPrefix)
-                let head = String(decrypted.prefix(8))
                 let valid = decrypted.hasPrefix("sk-ant-")
-                debugLog(claudeLog, "key #\(idx) → decrypt OK, len=\(decrypted.count), head=\(head), valid=\(valid ? "YES" : "NO")")
-                if valid { return decrypted }
+                debugLog(claudeLog, "key #\(idx) → decrypt OK, len=\(decrypted.count), valid=\(valid ? "YES" : "NO")")
+                if valid { return BrowserSession(sessionKey: decrypted, lastActiveOrgId: lastActiveOrg()) }
             } catch {
                 debugLog(claudeLog, "key #\(idx) → decrypt FAILED: \(error)")
             }
@@ -306,10 +335,54 @@ final class ClaudeCookiesReader {
         throw ClaudeCookiesError.decryptionFailed
     }
 
+    /// Newest non-expired claude.ai cookie row with the given name: (plaintext value, encrypted blob).
+    private func readCookieRow(db: OpaquePointer, name: String) throws -> (String?, Data?) {
+        let sql = "SELECT name, value, encrypted_value FROM cookies WHERE host_key IN (?1, ?2) AND name = ?3 AND (expires_utc = 0 OR expires_utc > ?4) ORDER BY expires_utc DESC LIMIT 1;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw ClaudeCookiesError.parsingFailed("SQLite prepare failed")
+        }
+        defer { sqlite3_finalize(stmt) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(stmt, 1, Self.claudeDomain, -1, transient)
+        sqlite3_bind_text(stmt, 2, "." + Self.claudeDomain, -1, transient)
+        sqlite3_bind_text(stmt, 3, name, -1, transient)
+        sqlite3_bind_int64(stmt, 4, Int64((Date().timeIntervalSince1970 + 11_644_473_600) * 1_000_000))
+
+        var plainValue: String?
+        var encryptedData: Data?
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            if let raw = sqlite3_column_text(stmt, 1) {
+                let val = String(cString: raw)
+                if !val.isEmpty { plainValue = val }
+            }
+            let blobLen = sqlite3_column_bytes(stmt, 2)
+            if blobLen > 0, let blobPtr = sqlite3_column_blob(stmt, 2) {
+                encryptedData = Data(bytes: blobPtr, count: Int(blobLen))
+            }
+        }
+        return (plainValue, encryptedData)
+    }
+
     // MARK: - Claude API Calls
 
-    /// GET /api/organizations → returns first org UUID with chat capability.
-    private func fetchOrgId(sessionKey: String) async throws -> String {
+    /// The browser's last active org wins when it is still in the list; otherwise the first
+    /// org with chat capability (then the first org at all).
+    static func selectOrganization(from orgs: [[String: Any]], preferredOrgId: String?) -> String? {
+        if let preferred = preferredOrgId?.lowercased(),
+           let match = orgs.first(where: { ($0["uuid"] as? String)?.lowercased() == preferred }) {
+            return match["uuid"] as? String
+        }
+        let selected = orgs.first(where: {
+            let caps = $0["capabilities"] as? [String] ?? []
+            return caps.contains("chat")
+        }) ?? orgs.first
+        return selected?["uuid"] as? String
+    }
+
+    /// GET /api/organizations → the browser's active org, else first org with chat capability.
+    private func fetchOrgId(sessionKey: String, preferredOrgId: String?) async throws -> String {
         let url = URL(string: "\(Self.baseURL)/organizations")!
         let request = makeRequest(url: url, sessionKey: sessionKey)
         let (data, response) = try await session.data(for: request)
@@ -318,17 +391,12 @@ final class ClaudeCookiesReader {
         }
         switch http.statusCode {
         case 200: break
-        case 401, 403: throw ClaudeCookiesError.httpError(http.statusCode)
-        default: throw ClaudeCookiesError.httpError(http.statusCode)
+        default: throw ClaudeCookiesError.forHTTPFailure(http)
         }
         guard let orgs = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             throw ClaudeCookiesError.parsingFailed("Cannot parse organizations list")
         }
-        let selected = orgs.first(where: {
-            let caps = $0["capabilities"] as? [String] ?? []
-            return caps.contains("chat")
-        }) ?? orgs.first
-        guard let org = selected, let uuid = org["uuid"] as? String else {
+        guard let uuid = Self.selectOrganization(from: orgs, preferredOrgId: preferredOrgId) else {
             throw ClaudeCookiesError.parsingFailed("No organization found")
         }
         return uuid
@@ -344,8 +412,7 @@ final class ClaudeCookiesReader {
         }
         switch http.statusCode {
         case 200: break
-        case 401, 403: throw ClaudeCookiesError.httpError(http.statusCode)
-        default: throw ClaudeCookiesError.httpError(http.statusCode)
+        default: throw ClaudeCookiesError.forHTTPFailure(http)
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ClaudeCookiesError.parsingFailed("Cannot parse usage response")
@@ -392,7 +459,8 @@ final class ClaudeCookiesReader {
     static func utilizationFraction(from raw: Any?) -> Double? {
         let rawPercent: Double?
         switch raw {
-        case let number as NSNumber where CFGetTypeID(number) != CFBooleanGetTypeID():
+        case let number as NSNumber:
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
             rawPercent = number.doubleValue
         case let string as String:
             rawPercent = Double(string)

@@ -7,9 +7,10 @@ private func cookieExpiryDate(for browser: String, hosts: [String], cookieName: 
     switch source {
     case .safari:
         guard let cookies = try? SafariBinaryCookies.readCookies(matching: hosts) else { return nil }
-        return cookies.first(where: { $0.name == cookieName })?.expiry
+        return cookies.first(where: { $0.name == cookieName || $0.name == cookieName + ".0" })?.expiry
     case .chrome, .brave, .edge:
         return ChromiumCookieDB.cookieExpiry(browser: source, cookieName: cookieName, hosts: hosts)
+            ?? ChromiumCookieDB.cookieExpiry(browser: source, cookieName: cookieName + ".0", hosts: hosts)
     }
 }
 
@@ -20,7 +21,8 @@ private func cookieExpiryStatus(for browser: String, hosts: [String], cookieName
 
 private func expiryStatusString(from expiry: Date) -> String {
     let days = Calendar.current.dateComponents([.day], from: Date(), to: expiry).day ?? 0
-    if days < 0 {
+    if expiry <= Date() {
+        if days == 0 { return "Expired today" }
         let ago = abs(days)
         return ago == 1 ? "Expired yesterday" : "Expired \(ago) days ago"
     } else if days == 0 {
@@ -42,47 +44,185 @@ private func expiryColor(_ status: String) -> Color {
 
 // MARK: - Root
 
+/// One "Providers" group with a page per provider: visibility, data source and connection
+/// live together instead of being split across Display / per-provider / Account limits tabs.
 struct SettingsView: View {
+    private enum Page: Hashable {
+        case provider(Provider)
+        case about
+    }
+
+    @State private var selection: Page = .provider(.claude)
+
     var body: some View {
-        TabView {
-            ProviderVisibilitySettingsTab()
-                .tabItem { Label("Display", systemImage: "eye") }
-            ClaudeSettingsTab()
-                .tabItem { Label("Claude", systemImage: "brain") }
-            OpenAISettingsTab()
-                .tabItem { Label("ChatGPT", systemImage: "bubble.left") }
-            AboutTab()
-                .tabItem { Label("About", systemImage: "info.circle") }
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Settings")
+                    .font(.headline)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 10)
+
+                Text("Providers")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 2)
+
+                ForEach(Provider.allCases, id: \.self) { provider in
+                    sidebarButton(.provider(provider)) {
+                        ProviderSidebarLabel(provider: provider, isSelected: selection == .provider(provider))
+                    }
+                }
+
+                Divider().padding(.vertical, 8)
+
+                sidebarButton(.about) {
+                    Label("About", systemImage: "info.circle")
+                }
+                Spacer()
+            }
+            .padding(12)
+            .frame(width: 190)
+            .frame(maxHeight: .infinity)
+            .background(.thinMaterial)
+
+            Divider()
+
+            Group {
+                switch selection {
+                case .provider(let provider): ProviderSettingsPage(provider: provider).id(provider)
+                case .about: AboutTab()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 480, height: 560)
+        .frame(width: 700, height: 600)
+    }
+
+    private func sidebarButton<Content: View>(_ page: Page, @ViewBuilder label: () -> Content) -> some View {
+        Button {
+            selection = page
+        } label: {
+            label()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(selection == page ? Color.white : Color.primary)
+        .background(selection == page ? Color.accentColor : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 7))
+        .accessibilityAddTraits(selection == page ? .isSelected : [])
     }
 }
 
 // MARK: - Provider visibility
 
-private struct ProviderVisibilitySettingsTab: View {
-    @AppStorage("display.provider.claude") private var showClaude = true
-    @AppStorage("display.provider.openai") private var showOpenAI = true
+extension Provider {
+    /// UserDefaults key read by the menu bar label and dropdown.
+    var menuBarVisibilityKey: String {
+        self == .codex ? "display.provider.openai" : "display.provider.\(rawValue)"
+    }
+
+    var visibleByDefault: Bool { !usesAccountQuota }
+
+    /// One line on where this provider's numbers come from.
+    var dataSourceSummary: String {
+        switch self {
+        case .claude:
+            return "Limit % comes from your claude.ai browser session. Local Claude Code and Pi logs add tokens and cost."
+        case .codex:
+            return "Limit % comes from your chatgpt.com browser session. Local Codex CLI and Pi logs add tokens and cost."
+        case .gemini:
+            return "Model quotas from Google, using your Gemini CLI or Antigravity (agy) sign-in. gemini.google.com chat limits are not available."
+        case .kimi:
+            return "Kimi Code quotas, using your Kimi Code CLI sign-in while it is active, or a Kimi Code API key."
+        case .glm:
+            return "GLM Coding Plan quotas from Z.ai or Zhipu, using a Coding Plan API key."
+        }
+    }
+}
+
+private struct ProviderSidebarLabel: View {
+    let provider: Provider
+    let isSelected: Bool
+    @AppStorage private var visible: Bool
+
+    init(provider: Provider, isSelected: Bool) {
+        self.provider = provider
+        self.isSelected = isSelected
+        _visible = AppStorage(wrappedValue: provider.visibleByDefault, provider.menuBarVisibilityKey)
+    }
 
     var body: some View {
-        Form {
-            Section {
-                Toggle("Claude Code", isOn: $showClaude)
-                Toggle("ChatGPT / Codex", isOn: $showOpenAI)
-            } header: {
-                Text("Providers shown")
-            } footer: {
-                Text("Hidden providers stay configured and can be added back at any time.")
+        HStack {
+            Label(provider.displayName, systemImage: provider.symbolName)
+            Spacer()
+            if visible {
+                Image(systemName: "menubar.rectangle")
+                    .font(.caption2)
+                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary)
+                    .help("Shown in the menu bar")
             }
         }
-        .formStyle(.grouped)
-        .padding()
+    }
+}
+
+/// First section of every provider page.
+struct MenuBarVisibilitySection: View {
+    let provider: Provider
+    @AppStorage private var visible: Bool
+
+    init(provider: Provider) {
+        self.provider = provider
+        _visible = AppStorage(wrappedValue: provider.visibleByDefault, provider.menuBarVisibilityKey)
+    }
+
+    var body: some View {
+        Section {
+            Toggle("Show in menu bar and menu", isOn: $visible)
+        } header: {
+            Text("Display")
+        } footer: {
+            Text("Shown providers rotate in the menu bar every 30 seconds; right-click the icon to switch. Hidden providers stay configured.")
+        }
+    }
+}
+
+private struct ProviderSettingsPage: View {
+    let provider: Provider
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: provider.symbolName)
+                    .font(.title2)
+                    .foregroundColor(.accentColor)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(provider.displayName).font(.title3.weight(.semibold))
+                    Text(provider.dataSourceSummary)
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding([.horizontal, .top], 20)
+
+            switch provider {
+            case .claude: ProviderSettingsTab(config: .claude)
+            case .codex: ProviderSettingsTab(config: .openai)
+            case .gemini, .kimi, .glm: AccountQuotaSettingsPage(provider: provider)
+            }
+        }
     }
 }
 
 // MARK: - Provider tab config
 
 private struct ProviderTabConfig {
+    let provider: Provider
     let cookiesEnabledKey: String
     let cookiesSourceKey: String
     let displaySourceKey: String
@@ -98,6 +238,7 @@ private struct ProviderTabConfig {
 
 extension ProviderTabConfig {
     static let claude = ProviderTabConfig(
+        provider:           .claude,
         cookiesEnabledKey:  "cookies.enabled.claude",
         cookiesSourceKey:   "cookies.source.claude",
         displaySourceKey:   "display.source.claude",
@@ -112,6 +253,7 @@ extension ProviderTabConfig {
     )
 
     static let openai = ProviderTabConfig(
+        provider:           .codex,
         cookiesEnabledKey:  "cookies.enabled.openai",
         cookiesSourceKey:   "cookies.source.openai",
         displaySourceKey:   "display.source.openai",
@@ -153,6 +295,8 @@ private struct ProviderSettingsTab: View {
 
     var body: some View {
         Form {
+            MenuBarVisibilitySection(provider: config.provider)
+
             // ── Subscription (browser cookies) ──────────────────────────
             Section {
                 Toggle("Use browser session cookies", isOn: $cookiesEnabled)
@@ -172,12 +316,17 @@ private struct ProviderSettingsTab: View {
                     Button("Test connection") {
                         Task {
                             cookiesTesting = true
-                            cookiesStatus = await config.testCookies()
-                            cookieExpiry = cookieExpiryStatus(
-                                for: browserSource,
-                                hosts: config.cookieHosts,
-                                cookieName: config.cookieName
-                            )
+                            let testedSource = browserSource
+                            let result = await config.testCookies()
+                            let hosts = config.cookieHosts
+                            let name = config.cookieName
+                            let expiry = await Task.detached {
+                                cookieExpiryStatus(for: testedSource, hosts: hosts, cookieName: name)
+                            }.value
+                            if cookiesEnabled && browserSource == testedSource {
+                                cookiesStatus = result
+                                cookieExpiry = expiry
+                            }
                             cookiesTesting = false
                         }
                     }
@@ -230,20 +379,29 @@ private struct ProviderSettingsTab: View {
 
                 HStack(spacing: 8) {
                     Button("Save") {
-                        try? KeychainStore.set(apiKey, for: config.apiKeyAccount)
-                        apiKey = ""
-                        apiKeyHasValue = true
-                        apiStatus = "Saved"
+                        do {
+                            try KeychainStore.set(apiKey.trimmingCharacters(in: .whitespacesAndNewlines), for: config.apiKeyAccount)
+                            apiKey = ""
+                            apiKeyHasValue = true
+                            apiStatus = "Saved"
+                            notifyAPIKeyChanged()
+                        } catch {
+                            apiStatus = "Could not save key: \(error.localizedDescription)"
+                        }
                     }
-                    .disabled(apiKey.isEmpty)
+                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || apiTesting)
 
                     Button("Clear") {
-                        KeychainStore.delete(account: config.apiKeyAccount)
+                        guard KeychainStore.delete(account: config.apiKeyAccount) else {
+                            apiStatus = "Could not remove key from Keychain."
+                            return
+                        }
                         apiKey = ""
                         apiKeyHasValue = false
                         apiStatus = ""
+                        notifyAPIKeyChanged()
                     }
-                    .disabled(!apiKeyHasValue)
+                    .disabled(!apiKeyHasValue || apiTesting)
 
                     Button("Test connection") {
                         Task {
@@ -295,19 +453,20 @@ private struct ProviderSettingsTab: View {
         .onAppear {
             apiKeyHasValue = KeychainStore.has(account: config.apiKeyAccount)
         }
+        .onChange(of: browserSource) { _, _ in
+            cookiesStatus = ""
+            cookieExpiry = nil
+        }
+        .onChange(of: cookiesEnabled) { _, _ in
+            cookiesStatus = ""
+            cookieExpiry = nil
+        }
     }
-}
 
-// MARK: - Claude Tab
-
-struct ClaudeSettingsTab: View {
-    var body: some View { ProviderSettingsTab(config: .claude) }
-}
-
-// MARK: - OpenAI Tab
-
-struct OpenAISettingsTab: View {
-    var body: some View { ProviderSettingsTab(config: .openai) }
+    private func notifyAPIKeyChanged() {
+        let key = "\(config.apiKeyAccount).revision"
+        UserDefaults.standard.set(UserDefaults.standard.integer(forKey: key) &+ 1, forKey: key)
+    }
 }
 
 // MARK: - About Tab
@@ -331,7 +490,7 @@ struct AboutTab: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
 
-            Text("Menubar usage monitor for Claude and ChatGPT.")
+            Text("Menubar usage monitor for Claude, ChatGPT, Gemini, Kimi, and GLM.")
                 .font(.body)
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)

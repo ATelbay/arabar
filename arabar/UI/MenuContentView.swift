@@ -38,6 +38,15 @@ struct MenuContentView: View {
     @Environment(\.openWindow) private var openWindow
     @AppStorage("display.provider.claude") private var showClaude = true
     @AppStorage("display.provider.openai") private var showOpenAI = true
+    @AppStorage("display.provider.gemini") private var showGemini = false
+    @AppStorage("display.provider.kimi") private var showKimi = false
+    @AppStorage("display.provider.glm") private var showGLM = false
+
+    private var visibleQuotaProviders: [Provider] {
+        [showGemini ? Provider.gemini : nil,
+         showKimi ? Provider.kimi : nil,
+         showGLM ? Provider.glm : nil].compactMap { $0 }
+    }
 
     private let relativeFmt: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
@@ -52,18 +61,39 @@ struct MenuContentView: View {
                 .font(.headline)
                 .padding(.bottom, 8)
 
+            ScrollView {
+                providerSections
+            }
+            .frame(maxHeight: 460)
+
+            Divider().padding(.vertical, 8)
+
+            // ── Footer ──────────────────────────────────────────────────
+            footer
+        }
+        .padding(12)
+        .frame(width: 280)
+        .task {
+            if viewModel.lastRefreshAt == nil {
+                await viewModel.refresh()
+            }
+        }
+    }
+
+    private var providerSections: some View {
+        VStack(alignment: .leading, spacing: 0) {
             if showClaude {
                 // ── Claude primary section ───────────────────────────────
                 providerSection(
                     icon: "brain",
-                    title: "Claude Code",
-                    snapshot: viewModel.claudeSnapshot,
+                    title: viewModel.usesAPIDisplay(for: .claude) ? "Claude API" : "Claude Code",
+                    snapshot: viewModel.snapshot(for: .claude),
                     status: viewModel.claudeStatus,
-                    provider: .claude
+                    provider: viewModel.usesAPIDisplay(for: .claude) ? nil : .claude
                 )
 
                 // ── Claude API secondary section (only when distinct) ────
-                if let apiSnap = viewModel.claudeApiSnapshot, apiSnap != viewModel.claudeSnapshot {
+                if let apiSnap = viewModel.claudeApiSnapshot, !viewModel.usesAPIDisplay(for: .claude) {
                     Divider().padding(.vertical, 4)
                     if viewModel.claudeSnapshot != nil {
                         HStack(spacing: 6) {
@@ -93,14 +123,14 @@ struct MenuContentView: View {
                 // ── Codex / ChatGPT primary section ─────────────────────
                 providerSection(
                     icon: "message.fill",
-                    title: "ChatGPT / Codex",
-                    snapshot: viewModel.codexSnapshot,
+                    title: viewModel.usesAPIDisplay(for: .codex) ? "OpenAI API" : "ChatGPT / Codex",
+                    snapshot: viewModel.snapshot(for: .codex),
                     status: viewModel.codexStatus,
-                    provider: .codex
+                    provider: viewModel.usesAPIDisplay(for: .codex) ? nil : .codex
                 )
 
                 // ── OpenAI API secondary section (only when distinct) ────
-                if let apiSnap = viewModel.codexApiSnapshot, apiSnap != viewModel.codexSnapshot {
+                if let apiSnap = viewModel.codexApiSnapshot, !viewModel.usesAPIDisplay(for: .codex) {
                     Divider().padding(.vertical, 4)
                     if viewModel.codexSnapshot != nil {
                         HStack(spacing: 6) {
@@ -122,27 +152,68 @@ struct MenuContentView: View {
                 }
             }
 
-            if !showClaude && !showOpenAI {
+            ForEach(visibleQuotaProviders, id: \.self) { provider in
+                if showClaude || showOpenAI || provider != visibleQuotaProviders.first {
+                    Divider().padding(.vertical, 8)
+                }
+                accountQuotaSection(provider: provider)
+            }
+
+            if !showClaude && !showOpenAI && visibleQuotaProviders.isEmpty {
                 Text("No providers selected")
                     .font(.caption)
                     .foregroundColor(.secondary)
-            }
-
-            Divider().padding(.vertical, 8)
-
-            // ── Footer ──────────────────────────────────────────────────
-            footer
-        }
-        .padding(12)
-        .frame(width: 280)
-        .task {
-            if viewModel.lastRefreshAt == nil {
-                await viewModel.refresh()
             }
         }
     }
 
     // MARK: - Provider section
+
+    private func quotaSectionTitle(for provider: Provider) -> String {
+        guard provider == .gemini else { return provider.displayName }
+        return AccountQuotaConfiguration.load(provider: .gemini).source == GeminiQuotaSource.antigravity
+            ? "Gemini · Antigravity" : "Gemini Code Assist"
+    }
+
+    private func accountQuotaSection(provider: Provider) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(quotaSectionTitle(for: provider), systemImage: provider.symbolName)
+                .font(.subheadline.weight(.semibold))
+            if let snapshot = viewModel.accountQuotas[provider] {
+                ForEach(snapshot.windows) { window in
+                    let freshness = window.freshness(generatedAt: snapshot.generatedAt, now: Date())
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(window.label)
+                                .lineLimit(2)
+                            Spacer()
+                            Text(freshness == .expired ? "ukwn" : "\(Int((window.remainingFraction * 100).rounded()))% left")
+                                .foregroundColor(freshness == .expired ? .secondary : remainingColor(for: window.remainingFraction))
+                        }
+                        .font(.caption)
+                        if freshness != .expired {
+                            ProgressView(value: window.remainingFraction)
+                                .tint(remainingColor(for: window.remainingFraction))
+                        }
+                        if let reset = window.resetAt, reset > Date() {
+                            Text(resetIn(reset)).font(.caption2).foregroundColor(.secondary)
+                        }
+                        if freshness != .fresh {
+                            Text(freshness == .expired ? "Expired — refresh to update" : "Cached — updated \(shortAge(since: snapshot.generatedAt, now: Date()))")
+                                .font(.caption2).foregroundColor(.orange)
+                        }
+                    }
+                }
+            }
+            if let error = viewModel.accountQuotaErrors[provider] {
+                Text(error).font(.caption).foregroundColor(.orange)
+            } else if viewModel.accountQuotas[provider] == nil {
+                Text(AccountQuotaConfiguration.load(provider: provider).enabled
+                     ? "Waiting for account limits…" : "Connect in Settings → Providers.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+    }
 
     @ViewBuilder
     private func providerSection(
@@ -217,15 +288,21 @@ struct MenuContentView: View {
                     snapshot.sessionWindow,
                     sibling: snapshot.weeklyWindow
                 ) {
-                    windowRow(label: "5h", window: snapshot.sessionWindow, generatedAt: snapshot.generatedAt)
+                    windowRow(label: windowLabel(snapshot.sessionWindow), window: snapshot.sessionWindow, generatedAt: snapshot.generatedAt)
                 }
                 if QuotaWindowVisibility.shouldShow(
                     snapshot.weeklyWindow,
                     sibling: snapshot.sessionWindow
                 ) {
-                    windowRow(label: "7d", window: snapshot.weeklyWindow, generatedAt: snapshot.generatedAt)
+                    windowRow(label: windowLabel(snapshot.weeklyWindow), window: snapshot.weeklyWindow, generatedAt: snapshot.generatedAt)
                 }
 
+
+            } else {
+                Text(viewModel.isRefreshing ? "Loading…" : "No usage data available. Check your sources in Settings.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
                 if let level = status?.level,
                    level != .operational,
                    level != .unknown,
@@ -240,11 +317,6 @@ struct MenuContentView: View {
                             .lineLimit(2)
                     }
                 }
-            } else {
-                Text("Loading…")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
         }
     }
 
@@ -254,6 +326,7 @@ struct MenuContentView: View {
         switch provider {
         case .claude: return viewModel.claudeCookieExpiresAt
         case .codex:  return viewModel.codexCookieExpiresAt
+        case .gemini, .kimi, .glm: return nil
         }
     }
 
@@ -261,6 +334,7 @@ struct MenuContentView: View {
         switch provider {
         case .claude: return viewModel.claudeSessionExpired
         case .codex:  return viewModel.codexSessionExpired
+        case .gemini, .kimi, .glm: return false
         }
     }
 
@@ -389,6 +463,13 @@ struct MenuContentView: View {
                 }
             }
 
+            if let error = viewModel.lastError {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             // Row 2: action buttons (left-clustered)
             HStack {
                 Button {
@@ -417,6 +498,10 @@ struct MenuContentView: View {
     }
 
     // MARK: - Helpers
+
+    private func windowLabel(_ window: WindowSnapshot) -> String {
+        window.durationHours % 24 == 0 ? "\(window.durationHours / 24)d" : "\(window.durationHours)h"
+    }
 
     private func remainingColor(for remaining: Double) -> Color {
         switch Int((remaining * 100).rounded()) {

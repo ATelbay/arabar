@@ -48,8 +48,14 @@ enum ChromiumCookieDB {
     static func profileCookiesPaths(underRoot root: String) -> [String] {
         let fm = FileManager.default
         var results: [String] = []
-        let defaultPath = "\(root)/Default/Cookies"
-        if fm.fileExists(atPath: defaultPath) { results.append(defaultPath) }
+        func appendProfile(_ profile: String) {
+            // Chromium versions/platforms use either location; prefer Network when present.
+            for suffix in ["Network/Cookies", "Cookies"] {
+                let path = "\(root)/\(profile)/\(suffix)"
+                if fm.fileExists(atPath: path) { results.append(path); return }
+            }
+        }
+        appendProfile("Default")
         guard let entries = try? fm.contentsOfDirectory(atPath: root) else { return results }
         let profileDirs = entries
             .filter { $0.hasPrefix("Profile ") && $0.dropFirst(8).allSatisfy(\.isNumber) }
@@ -59,8 +65,7 @@ enum ChromiumCookieDB {
                 return na < nb
             }
         for dir in profileDirs {
-            let p = "\(root)/\(dir)/Cookies"
-            if fm.fileExists(atPath: p) { results.append(p) }
+            appendProfile(dir)
         }
         return results
     }
@@ -68,12 +73,13 @@ enum ChromiumCookieDB {
     // MARK: - Single DB query
 
     private static func cookieExpiry(dbPath: String, cookieName: String, hosts: [String]) -> Date? {
-        guard let tmpURL = copyToTemp(dbPath) else { return nil }
+        guard let tmpURL = try? snapshotToTemp(dbPath) else { return nil }
         defer { try? FileManager.default.removeItem(at: tmpURL) }
 
         var db: OpaquePointer?
         guard sqlite3_open_v2(tmpURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
               let db = db else {
+            sqlite3_close(db)
             debugLog(chromiumLog, "SQLite open failed: \(dbPath)")
             return nil
         }
@@ -142,6 +148,7 @@ enum ChromiumCookieDB {
     /// When `hasHashPrefix` is true (DB version ≥ 24), drops the leading 32-byte SHA256(host_key) from plaintext.
     static func decryptChromeCookieBlob(_ data: Data, key: Data, hasHashPrefix: Bool) throws -> String {
         guard data.count > 3 else { throw ChromiumDecryptError.invalidPrefix }
+        guard key.count == kCCKeySizeAES128 else { throw ChromiumDecryptError.invalidPlaintext }
         let prefix = String(data: data.prefix(3), encoding: .utf8) ?? ""
         let ciphertext: Data
         if prefix == "v10" || prefix == "v11" {
@@ -178,7 +185,8 @@ enum ChromiumCookieDB {
             throw ChromiumDecryptError.decryptionFailed(status)
         }
         outputBuf = outputBuf.prefix(decryptedLen)
-        if hasHashPrefix && outputBuf.count > 32 {
+        if hasHashPrefix {
+            guard outputBuf.count >= 32 else { throw ChromiumDecryptError.invalidPlaintext }
             outputBuf = outputBuf.dropFirst(32)
         }
         guard let plaintext = String(data: outputBuf, encoding: .utf8) else {
@@ -187,26 +195,59 @@ enum ChromiumCookieDB {
         return plaintext
     }
 
-    // MARK: - Temp copy (avoids DB lock while browser is running)
+    // MARK: - Consistent SQLite snapshot
 
-    private static func copyToTemp(_ path: String) -> URL? {
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("arabar_expiry_\(UUID().uuidString).db")
-        do {
-            try FileManager.default.copyItem(atPath: path, toPath: tmp.path)
-            return tmp
-        } catch {
-            debugLog(chromiumLog, "Failed to copy DB \(path): \(error)")
-            return nil
+    enum SnapshotError: Error { case sqlite(Int32) }
+
+    /// SQLite's backup API includes committed WAL pages and takes a consistent snapshot.
+    /// Copying only the main file loses recently refreshed cookies while the browser is open.
+    static func snapshotToTemp(_ path: String) throws -> URL {
+        var source: OpaquePointer?
+        let sourceStatus = sqlite3_open_v2(path, &source, SQLITE_OPEN_READONLY, nil)
+        guard sourceStatus == SQLITE_OK, let source else {
+            sqlite3_close(source)
+            throw SnapshotError.sqlite(sourceStatus)
         }
+        defer { sqlite3_close(source) }
+        sqlite3_busy_timeout(source, 1000)
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("arabar_\(UUID().uuidString).db")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: nil,
+                                            attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        var succeeded = false
+        defer {
+            if !succeeded { try? FileManager.default.removeItem(at: tmp) }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                try? FileManager.default.removeItem(atPath: tmp.path + suffix)
+            }
+        }
+        var destination: OpaquePointer?
+        let destinationStatus = sqlite3_open_v2(tmp.path, &destination, SQLITE_OPEN_READWRITE, nil)
+        guard destinationStatus == SQLITE_OK, let destination else {
+            sqlite3_close(destination)
+            throw SnapshotError.sqlite(destinationStatus)
+        }
+        defer { sqlite3_close(destination) }
+        guard let backup = sqlite3_backup_init(destination, "main", source, "main") else {
+            throw SnapshotError.sqlite(sqlite3_errcode(destination))
+        }
+        let stepStatus = sqlite3_backup_step(backup, -1)
+        let finishStatus = sqlite3_backup_finish(backup)
+        guard stepStatus == SQLITE_DONE, finishStatus == SQLITE_OK else {
+            throw SnapshotError.sqlite(stepStatus == SQLITE_DONE ? finishStatus : stepStatus)
+        }
+        // Ensure the returned snapshot is a single self-contained file.
+        let journalStatus = sqlite3_exec(destination, "PRAGMA journal_mode=DELETE", nil, nil, nil)
+        guard journalStatus == SQLITE_OK else { throw SnapshotError.sqlite(journalStatus) }
+        succeeded = true
+        return tmp
     }
 
-    /// Copies the SQLite DB at `sourcePath` to a temp location, calls `body` with the temp URL,
-    /// then deletes the temp file. Use this to avoid locking a live browser DB.
     static func withTempCopy<T>(of sourcePath: String, _ body: (URL) throws -> T) throws -> T {
-        let tmpURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("arabar_\(UUID().uuidString).db")
-        try FileManager.default.copyItem(at: URL(fileURLWithPath: sourcePath), to: tmpURL)
+        let tmpURL = try snapshotToTemp(sourcePath)
         defer { try? FileManager.default.removeItem(at: tmpURL) }
         return try body(tmpURL)
     }

@@ -8,6 +8,7 @@ import AppKit
 /// updates exactly the cookie store the next refresh will read.
 enum BrowserLauncher {
     static func openLogin(for provider: Provider) {
+        guard !provider.usesAccountQuota else { return }
         let urlString = provider == .codex ? "https://chatgpt.com/" : "https://claude.ai/"
         guard let url = URL(string: urlString) else { return }
 

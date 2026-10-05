@@ -22,6 +22,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBarController = MenuBarController(viewModel: viewModel)
         lifecycle.attach(to: viewModel)
+        // A sole `Window` scene is presented at launch (including as a Login Item).
+        // `.defaultLaunchBehavior(.suppressed)` needs macOS 15, so close it once here;
+        // "Settings…" reopens it through openWindow(id:).
+        DispatchQueue.main.async {
+            for window in NSApp.windows where window.identifier?.rawValue.hasPrefix("settings") == true {
+                window.close()
+            }
+        }
     }
 
     // SwiftUI's Window scene defaults to quitting the app when the last window closes,

@@ -64,8 +64,9 @@ struct WhamUsageResponse: Decodable {
     }
 
     struct RateWindow: Decodable {
-        let usedPercent: Int
-        let resetAt: Int
+        // Doubles: an Int field would fail the whole decode on a fractional value.
+        let usedPercent: Double
+        let resetAt: Double
         let limitWindowSeconds: Int
 
         enum CodingKeys: String, CodingKey {
@@ -163,15 +164,13 @@ enum OpenAIUsageSnapshotMapper {
         let hours = rateWindow.limitWindowSeconds > 0
             ? rateWindow.limitWindowSeconds / 3600
             : fallbackHours
-        // The endpoint reports used_percent with a floor of 1. Subtract that floor so an
-        // otherwise idle account reads as 100% remaining rather than 99%.
-        let adjustedUsedPercent = max(0, rateWindow.usedPercent - 1)
+        let adjustedUsedPercent = min(100, max(0, rateWindow.usedPercent))
         return WindowSnapshot(
             durationHours: hours,
             tokensUsed: 0,
             costUSD: 0,
-            percentUsed: Double(adjustedUsedPercent) / 100.0,
-            resetAt: Date(timeIntervalSince1970: TimeInterval(rateWindow.resetAt)),
+            percentUsed: adjustedUsedPercent / 100.0,
+            resetAt: Date(timeIntervalSince1970: rateWindow.resetAt),
             percentSource: .authoritative
         )
     }
@@ -235,10 +234,10 @@ final class OpenAICookiesReader {
         guard UserDefaults.standard.bool(forKey: Self.enabledKey) else {
             return "Disabled (opt-in not set)"
         }
+        let source = BrowserSource(
+            rawValue: UserDefaults.standard.string(forKey: Self.sourceKey) ?? "safari"
+        ) ?? .safari
         do {
-            let source = BrowserSource(
-                rawValue: UserDefaults.standard.string(forKey: Self.sourceKey) ?? "safari"
-            ) ?? .safari
             let cookieStr = try extractCookieHeader(from: source)
             let masked = cookieStr.prefix(20).appending("…[masked]")
             debugLog(openaiLog, "Cookie header prefix: \(masked)")
@@ -249,7 +248,13 @@ final class OpenAICookiesReader {
         } catch OpenAICookiesError.cookiesNotFound {
             return "Error: no chatgpt.com cookies found. Are you logged in?"
         } catch OpenAICookiesError.keychainAccessDenied {
-            return "Open Keychain Access.app, find 'Chrome Safe Storage', and add arabar to its Access Control list."
+            let service: String
+            switch source {
+            case .brave: service = "Brave Safe Storage"
+            case .edge: service = "Microsoft Edge Safe Storage"
+            case .chrome, .safari: service = "Chrome Safe Storage"
+            }
+            return "Open Keychain Access.app, find '\(service)', and add arabar to its Access Control list."
         } catch OpenAICookiesError.decryptionFailed {
             return "Error: Cookie decryption failed"
         } catch OpenAICookiesError.appBoundEncryption {
@@ -306,9 +311,9 @@ final class OpenAICookiesReader {
                 try SafariBinaryCookies.readCookies(matching: ["chatgpt.com"])
             }
             // Collect all session-token cookies (bare + chunks)
-            let tokenCookies = cookies.filter { $0.name.hasPrefix(Self.sessionCookiePrefix) }
+            let tokenCookies = cookies.filter { $0.name.hasPrefix(Self.sessionCookiePrefix) && ($0.expiry == nil || $0.expiry! > Date()) }
             guard !tokenCookies.isEmpty else { throw OpenAICookiesError.cookiesNotFound }
-            return assembleNextAuthCookieHeader(pairs: tokenCookies.map { ($0.name, $0.value) })
+            return try assembleNextAuthCookieHeader(pairs: tokenCookies.map { ($0.name, $0.value) })
         }
     }
 
@@ -346,11 +351,9 @@ final class OpenAICookiesReader {
             do {
                 let header = try chromeCookieHeaderFromDB(path: dbPath, aesKeys: aesKeys)
                 return header
-            } catch OpenAICookiesError.cookiesNotFound {
-                lastError = OpenAICookiesError.cookiesNotFound
-                continue
             } catch {
-                throw error
+                if case OpenAICookiesError.cookiesNotFound = error { continue }
+                lastError = error
             }
         }
         throw lastError
@@ -359,13 +362,7 @@ final class OpenAICookiesReader {
     private func chromeCookieHeaderFromDB(path: String, aesKeys: [Data]) throws -> String {
         let tmp: URL
         do {
-            // Always copy — Chrome may lock the file
-            tmp = try {
-                let url = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("arabar_\(UUID().uuidString).db")
-                try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: url)
-                return url
-            }()
+            tmp = try ChromiumCookieDB.snapshotToTemp(path)
         } catch {
             throw OpenAICookiesError.cookiesNotFound
         }
@@ -373,6 +370,7 @@ final class OpenAICookiesReader {
 
         var db: OpaquePointer?
         guard sqlite3_open_v2(tmp.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db)
             throw OpenAICookiesError.cookiesNotFound
         }
         defer { sqlite3_close(db) }
@@ -384,16 +382,16 @@ final class OpenAICookiesReader {
 
     private func extractChromeCookies(db: OpaquePointer, aesKeys: [Data], hasHashPrefix: Bool) throws -> String {
         // Match exact prefix; ORDER BY name gives .0, .1, … in order
-        let sql = "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE ?1 AND name LIKE ?2 ORDER BY name"
+        let sql = "SELECT name, value, encrypted_value FROM cookies WHERE host_key IN ('chatgpt.com', '.chatgpt.com') AND name LIKE ?1 AND (expires_utc = 0 OR expires_utc > ?2) ORDER BY name"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw OpenAICookiesError.parsingFailed("SQLite prepare failed")
         }
         defer { sqlite3_finalize(stmt) }
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        sqlite3_bind_text(stmt, 1, "%chatgpt.com%", -1, transient)
         let namePattern = Self.sessionCookiePrefix + "%"
-        sqlite3_bind_text(stmt, 2, namePattern, -1, transient)
+        sqlite3_bind_text(stmt, 1, namePattern, -1, transient)
+        sqlite3_bind_int64(stmt, 2, Int64((Date().timeIntervalSince1970 + 11_644_473_600) * 1_000_000))
 
         let keylens = aesKeys.map { $0.count }.map(String.init).joined(separator: ",")
         debugLog(openaiLog, "keychain candidates: \(aesKeys.count), keylens=[\(keylens)]")
@@ -421,7 +419,7 @@ final class OpenAICookiesReader {
                     for (idx, key) in aesKeys.enumerated() {
                         do {
                             let plaintext = try ChromiumCookieDB.decryptChromeCookieBlob(encData, key: key, hasHashPrefix: hasHashPrefix)
-                            let valid = plaintext.count > 20
+                            let valid = !plaintext.isEmpty
                             debugLog(openaiLog, "key #\(idx) → decrypt OK, len=\(plaintext.count), valid=\(valid ? "YES" : "NO")")
                             if valid { value = plaintext; break }
                         } catch {
@@ -429,8 +427,7 @@ final class OpenAICookiesReader {
                         }
                     }
                     if value == nil {
-                        debugLog(openaiLog, "cookie \(name): no key produced valid plaintext, skipping row")
-                        continue
+                        throw OpenAICookiesError.decryptionFailed
                     }
                 }
             }
@@ -441,7 +438,7 @@ final class OpenAICookiesReader {
         }
 
         guard !pairs.isEmpty else { throw OpenAICookiesError.cookiesNotFound }
-        return assembleNextAuthCookieHeader(pairs: pairs)
+        return try assembleNextAuthCookieHeader(pairs: pairs)
     }
 
     // MARK: - NextAuth cookie assembly
@@ -449,9 +446,9 @@ final class OpenAICookiesReader {
     /// Builds the Cookie header for NextAuth split tokens.
     /// If the bare token exists, prefer it; otherwise sort chunks by numeric suffix and send as-split.
     /// The browser sends split cookies as separate name=value pairs; NextAuth reassembles server-side.
-    private func assembleNextAuthCookieHeader(pairs: [(String, String)]) -> String {
+    func assembleNextAuthCookieHeader(pairs: [(String, String)]) throws -> String {
         // Separate bare token from numbered chunks
-        let bare = pairs.first(where: { $0.0 == Self.sessionCookiePrefix })
+        let bare = pairs.first(where: { $0.0 == Self.sessionCookiePrefix && !$0.1.isEmpty })
         let chunks = pairs
             .filter { $0.0 != Self.sessionCookiePrefix && $0.0.hasPrefix(Self.sessionCookiePrefix + ".") }
             .sorted { lhs, rhs in
@@ -465,6 +462,12 @@ final class OpenAICookiesReader {
             return "\(bare.0)=\(bare.1)"
         }
 
+        guard !chunks.isEmpty else { throw OpenAICookiesError.cookiesNotFound }
+        for (index, chunk) in chunks.enumerated() {
+            guard chunk.0 == "\(Self.sessionCookiePrefix).\(index)", !chunk.1.isEmpty else {
+                throw OpenAICookiesError.parsingFailed("Incomplete session-token cookie chunks")
+            }
+        }
         // Split-chunk case: send as the browser would (each chunk as its own name=value pair)
         return chunks.map { "\($0.0)=\($0.1)" }.joined(separator: "; ")
     }
@@ -520,8 +523,7 @@ final class OpenAICookiesReader {
         do {
             sessionResp = try JSONDecoder().decode(SessionResponse.self, from: data)
         } catch {
-            let fragment = String(data: data.prefix(300), encoding: .utf8) ?? "<binary>"
-            debugLog(openaiLog, .error, "auth/session parse FAILED: \(error.localizedDescription), body=\(fragment)")
+            debugLog(openaiLog, .error, "auth/session parse FAILED: \(error.localizedDescription)")
             throw OpenAICookiesError.parsingFailed("session response: \(error.localizedDescription)")
         }
 
@@ -530,15 +532,28 @@ final class OpenAICookiesReader {
             throw OpenAICookiesError.sessionExchangeFailed(httpCode: 200)
         }
 
-        let accountId = sessionResp.user?.id
+        // A user ID (user-...) is not the ChatGPT workspace/account ID required here.
+        let accountId = Self.accountID(fromAccessToken: token)
         debugLog(openaiLog, "auth/session: token length=\(token.count), accountId present=\(accountId != nil ? "YES" : "NO"), expired=\(Self.jwtIsExpired(token) ? "YES" : "NO")")
         return (token, accountId)
     }
 
     // MARK: - JWT expiry
 
+    static func accountID(fromAccessToken token: String) -> String? {
+        guard let auth = jwtPayload(token)?["https://api.openai.com/auth"] as? [String: Any],
+              let account = auth["chatgpt_account_id"] as? String, !account.isEmpty else { return nil }
+        return account
+    }
+
     /// Reads the `exp` claim (seconds since epoch) from a JWT payload. nil if unparseable.
     private static func jwtExpiry(_ token: String) -> Date? {
+        guard let exp = jwtPayload(token)?["exp"] as? NSNumber,
+              CFGetTypeID(exp) != CFBooleanGetTypeID(), exp.doubleValue.isFinite else { return nil }
+        return Date(timeIntervalSince1970: exp.doubleValue)
+    }
+
+    private static func jwtPayload(_ token: String) -> [String: Any]? {
         let parts = token.split(separator: ".")
         guard parts.count >= 2 else { return nil }
         var b64 = String(parts[1])
@@ -549,9 +564,7 @@ final class OpenAICookiesReader {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        if let exp = obj["exp"] as? Double { return Date(timeIntervalSince1970: exp) }
-        if let exp = obj["exp"] as? Int { return Date(timeIntervalSince1970: Double(exp)) }
-        return nil
+        return obj
     }
 
     /// True only when `exp` is readable AND already in the past (30s skew). Unknown → false,

@@ -15,6 +15,9 @@ final class CodexUsageReader: @unchecked Sendable {
             var mtime: Date
             /// turn_id -> model string, carried across incremental reads
             var lastSessionModel: [String: String]
+            var sessionId: String?
+            var currentModel: String?
+            var lastTotalUsage: [String: Int]?
         }
     }
 
@@ -27,7 +30,7 @@ final class CodexUsageReader: @unchecked Sendable {
 
     // MARK: - Init
 
-    init(lookbackDays: Int = 30) {
+    init(lookbackDays: Int = 30, rootDirs: [URL]? = nil, cacheFile: URL? = nil) {
         self.lookbackDays = lookbackDays
 
         let codexHome = CodexAuth.codexHome()
@@ -39,40 +42,49 @@ final class CodexUsageReader: @unchecked Sendable {
             let envSessions = URL(fileURLWithPath: env).appendingPathComponent("sessions")
             if !dirs.contains(envSessions) { dirs.append(envSessions) }
         }
-        self.rootDirs = dirs
+        self.rootDirs = rootDirs ?? dirs
 
         let appSupport = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("arabar", isDirectory: true)
-        self.cacheFile = appSupport.appendingPathComponent("codex_cache.json")
+        self.cacheFile = cacheFile ?? appSupport.appendingPathComponent("codex_cache.json")
 
         // Load cache, or start fresh
-        if let data = try? Data(contentsOf: cacheFile),
+        if let data = try? Data(contentsOf: self.cacheFile),
            let loaded = try? JSONDecoder().decode(CacheState.self, from: data) {
             self.cache = loaded
         } else {
             self.cache = CacheState()
         }
-
-        // Ensure directory exists
-        try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
     }
 
     // MARK: - Public API
 
     /// Incremental read: only processes new bytes since last run.
     func fetchNewEvents() throws -> [UsageEvent] {
-        let events = try scan(rebuild: false)
-        try persistCache()
-        return events
+        let previous = cache
+        do {
+            let events = try scan(rebuild: false)
+            try persistCache()
+            return events
+        } catch {
+            cache = previous
+            throw error
+        }
     }
 
     /// Full rebuild: ignores cached offsets, re-reads everything within lookback window.
     func rebuildAll() throws -> [UsageEvent] {
-        cache.fileOffsets.removeAll()
-        let events = try scan(rebuild: true)
-        try persistCache()
-        return events
+        let previous = cache
+        do {
+            cache.fileOffsets.removeAll()
+            let events = try scan(rebuild: true)
+            try persistCache()
+            return events
+        } catch {
+            cache = previous
+            throw error
+        }
     }
 
     // MARK: - Core scan
@@ -90,7 +102,11 @@ final class CodexUsageReader: @unchecked Sendable {
                 guard mtime >= cutoff else { continue }
 
                 let cacheKey = fileURL.path
-                let cachedState = rebuild ? nil : cache.fileOffsets[cacheKey]
+                var cachedState = rebuild ? nil : cache.fileOffsets[cacheKey]
+                if let state = cachedState,
+                   state.byteOffset > (attrs[.size] as? UInt64 ?? 0) || mtime < state.mtime {
+                    cachedState = nil
+                }
 
                 // Skip if mtime unchanged and offset covers full file
                 if let cs = cachedState,
@@ -103,7 +119,7 @@ final class CodexUsageReader: @unchecked Sendable {
                 let fileEvents = parseFile(
                     at: fileURL,
                     startOffset: cachedState?.byteOffset ?? 0,
-                    existingModelMap: cachedState?.lastSessionModel ?? [:],
+                    existingState: cachedState,
                     mtime: mtime,
                     cacheKey: cacheKey
                 )
@@ -118,7 +134,7 @@ final class CodexUsageReader: @unchecked Sendable {
     private func parseFile(
         at url: URL,
         startOffset: UInt64,
-        existingModelMap: [String: String],
+        existingState: CacheState.FileState?,
         mtime: Date,
         cacheKey: String
     ) -> [UsageEvent] {
@@ -131,28 +147,20 @@ final class CodexUsageReader: @unchecked Sendable {
         }
 
         // Read remaining bytes
-        guard let data = try? handle.readToEnd(), !data.isEmpty else {
-            // File unchanged — update mtime in cache
-            let prev = cache.fileOffsets[cacheKey]
-            cache.fileOffsets[cacheKey] = CacheState.FileState(
-                byteOffset: startOffset,
-                mtime: mtime,
-                lastSessionModel: prev?.lastSessionModel ?? [:]
-            )
-            return []
-        }
-
-        let totalRead = startOffset + UInt64(data.count)
+        guard let data = try? handle.readToEnd(), !data.isEmpty,
+              let finalNewline = data.lastIndex(of: 0x0A) else { return [] }
+        let completeData = data.prefix(through: finalNewline)
+        let totalRead = startOffset + UInt64(completeData.count)
         var events: [UsageEvent] = []
-
-        // Carry over cross-read turn_id → model map
-        var turnModelMap: [String: String] = existingModelMap
-        var sessionId: String = fallbackSessionId(from: url)
-        var fallbackModel: String = "unknown"
-
-        // Split by newline
-        let lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
+        var turnModelMap = existingState?.lastSessionModel ?? [:]
+        var sessionId = existingState?.sessionId ?? fallbackSessionId(from: url)
+        var fallbackModel = existingState?.currentModel ?? "unknown"
+        var lastTotalUsage = existingState?.lastTotalUsage
+        var lineOffset = startOffset
+        let lines = completeData.split(separator: 0x0A, omittingEmptySubsequences: false)
         for lineData in lines {
+            let recordOffset = lineOffset
+            lineOffset += UInt64(lineData.count + 1)
             guard let record = parseRecord(Data(lineData)) else { continue }
 
             switch record.type {
@@ -162,15 +170,17 @@ final class CodexUsageReader: @unchecked Sendable {
                     sessionId = id
                 }
                 if let payload = record.payloadDict,
-                   let modelProvider = payload["model_provider"] as? String {
-                    fallbackModel = modelProvider
+                   let model = payload["model"] as? String {
+                    fallbackModel = model
                 }
 
             case "turn_context":
                 if let payload = record.payloadDict,
-                   let turnId = payload["turn_id"] as? String,
                    let model = payload["model"] as? String {
-                    turnModelMap[turnId] = model
+                    fallbackModel = model
+                    if let turnId = payload["turn_id"] as? String {
+                        turnModelMap[turnId] = model
+                    }
                 }
 
             case "event_msg":
@@ -178,13 +188,23 @@ final class CodexUsageReader: @unchecked Sendable {
                       let payloadType = payload["type"] as? String,
                       payloadType == "token_count" else { continue }
 
+                guard record.timestamp != .distantPast else { continue }
                 guard let info = payload["info"] as? [String: Any],
                       let lastUsage = info["last_token_usage"] as? [String: Any] else { continue }
 
-                let inputTokens    = lastUsage["input_tokens"]           as? Int ?? 0
-                let cachedTokens   = lastUsage["cached_input_tokens"]    as? Int ?? 0
-                let outputTokens   = lastUsage["output_tokens"]          as? Int ?? 0
-                let reasoningTokens = lastUsage["reasoning_output_tokens"] as? Int ?? 0
+                // token_count can repeat the same cumulative usage when only rate
+                // limits change. Carry this fingerprint across incremental reads.
+                let totalUsage = info["total_token_usage"] as? [String: Int]
+                if let totalUsage, totalUsage == lastTotalUsage { continue }
+                lastTotalUsage = totalUsage
+
+                let totalInput = max(0, lastUsage["input_tokens"] as? Int ?? 0)
+                let totalOutput = max(0, lastUsage["output_tokens"] as? Int ?? 0)
+                let cachedTokens = min(totalInput, max(0, lastUsage["cached_input_tokens"] as? Int ?? 0))
+                let reasoningTokens = min(totalOutput, max(0, lastUsage["reasoning_output_tokens"] as? Int ?? 0))
+                // UsageEvent categories are exclusive, unlike the Codex wire format.
+                let inputTokens = totalInput - cachedTokens
+                let outputTokens = totalOutput - reasoningTokens
 
                 let turnId = payload["turn_id"] as? String
                 let model  = turnId.flatMap { turnModelMap[$0] } ?? fallbackModel
@@ -194,7 +214,7 @@ final class CodexUsageReader: @unchecked Sendable {
                     provider:            .codex,
                     model:               model,
                     sessionId:           sessionId,
-                    messageId:           turnId,
+                    messageId:           "codex:\(sessionId):\(recordOffset)",
                     inputTokens:         inputTokens,
                     outputTokens:        outputTokens,
                     cacheReadTokens:     0,
@@ -213,7 +233,10 @@ final class CodexUsageReader: @unchecked Sendable {
         cache.fileOffsets[cacheKey] = CacheState.FileState(
             byteOffset: totalRead,
             mtime: mtime,
-            lastSessionModel: turnModelMap
+            lastSessionModel: turnModelMap,
+            sessionId: sessionId,
+            currentModel: fallbackModel,
+            lastTotalUsage: lastTotalUsage
         )
         return events
     }
@@ -234,9 +257,9 @@ final class CodexUsageReader: @unchecked Sendable {
         if let tsStr = obj["timestamp"] as? String {
             timestamp = Self.isoFormatter.date(from: tsStr)
                      ?? Self.isoFallbackFormatter.date(from: tsStr)
-                     ?? Date()
+                     ?? .distantPast
         } else {
-            timestamp = Date()
+            timestamp = .distantPast
         }
 
         let payload = obj["payload"] as? [String: Any]
@@ -268,22 +291,20 @@ final class CodexUsageReader: @unchecked Sendable {
         encoder.outputFormatting = .prettyPrinted
         let data = try encoder.encode(cache)
 
-        // Atomic write via temp file
-        let tmpURL = cacheFile.deletingLastPathComponent()
-            .appendingPathComponent("codex_cache_tmp_\(UUID().uuidString).json")
-        try data.write(to: tmpURL, options: .atomic)
-        _ = try FileManager.default.replaceItemAt(cacheFile, withItemAt: tmpURL)
+        try FileManager.default.createDirectory(
+            at: cacheFile.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        // Data.atomic also creates a cache on the first run.
+        try data.write(to: cacheFile, options: .atomic)
     }
 
     // MARK: - Utilities
 
     private func fallbackSessionId(from url: URL) -> String {
-        // Extract sessionId from filename: rollout-<ISO>-<sessionId>.jsonl
         let name = url.deletingPathExtension().lastPathComponent
-        // Format: rollout-2024-01-15T12:34:56.789Z-<uuid>
-        if let lastDash = name.lastIndex(of: "-") {
-            let after = name.index(after: lastDash)
-            return String(name[after...])
+        if name.count >= 36 {
+            let candidate = String(name.suffix(36))
+            if UUID(uuidString: candidate) != nil { return candidate }
         }
         return name
     }

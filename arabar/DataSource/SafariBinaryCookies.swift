@@ -40,28 +40,44 @@ enum SafariBinaryCookies {
     private static let maxFileSize = 100 * 1024 * 1024  // 100 MB cap
     private static let appleEpochOffset: TimeInterval = 978307200  // seconds from Unix epoch to 2001-01-01
 
+    /// Sandboxed Safari (macOS 10.15+) keeps cookies inside its container; the legacy
+    /// location is kept as a fallback for older setups.
+    static var candidateFileURLs: [URL] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return [
+            home.appendingPathComponent("Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"),
+            home.appendingPathComponent("Library/Cookies/Cookies.binarycookies")
+        ]
+    }
+
     static func readCookies(matching hostMatches: [String]) throws -> [SafariCookie] {
-        let cookiesURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Cookies/Cookies.binarycookies")
+        // Read instead of checking existence first: without Full Disk Access the container
+        // path can look missing, and that must surface as accessDenied, not "not logged in".
+        var sawAccessDenied = false
+        for cookiesURL in candidateFileURLs {
+            let data: Data
+            do {
+                data = try Data(contentsOf: cookiesURL)
+            } catch let nsError as NSError where isPermissionError(nsError) {
+                sawAccessDenied = true
+                continue
+            } catch {
+                continue
+            }
 
-        guard FileManager.default.fileExists(atPath: cookiesURL.path) else {
-            throw SafariCookiesError.fileNotFound
+            guard data.count <= maxFileSize else {
+                throw SafariCookiesError.invalidFormat("File exceeds 100 MB limit")
+            }
+            return try parse(data: data, matching: hostMatches)
         }
+        throw sawAccessDenied ? SafariCookiesError.accessDenied : SafariCookiesError.fileNotFound
+    }
 
-        let data: Data
-        do {
-            data = try Data(contentsOf: cookiesURL)
-        } catch let nsError as NSError where nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(EPERM) {
-            throw SafariCookiesError.accessDenied
-        } catch let nsError as NSError where nsError.code == NSFileReadNoPermissionError {
-            throw SafariCookiesError.accessDenied
-        }
-
-        guard data.count <= maxFileSize else {
-            throw SafariCookiesError.invalidFormat("File exceeds 100 MB limit")
-        }
-
-        return try parse(data: data, matching: hostMatches)
+    private static func isPermissionError(_ error: NSError) -> Bool {
+        if error.domain == NSCocoaErrorDomain, error.code == NSFileReadNoPermissionError { return true }
+        let posix = (error.userInfo[NSUnderlyingErrorKey] as? NSError) ?? error
+        return posix.domain == NSPOSIXErrorDomain
+            && (posix.code == Int(EPERM) || posix.code == Int(EACCES))
     }
 
     // MARK: - Binary Parser
@@ -102,7 +118,7 @@ enum SafariBinaryCookies {
             let pageData = data.subdata(in: offset..<(offset + size))
             let cookies = try parsePage(pageData: pageData)
             for cookie in cookies {
-                if hostMatches.contains(where: { cookie.domain.contains($0) }) {
+                if hostMatches.contains(where: { domain(cookie.domain, matches: $0) }) {
                     results.append(cookie)
                 }
             }
@@ -110,6 +126,13 @@ enum SafariBinaryCookies {
         }
 
         return results
+    }
+
+    /// A cookie for a lookalike or child domain must never authenticate the parent host.
+    static func domain(_ cookieDomain: String, matches host: String) -> Bool {
+        let normalizedCookie = cookieDomain.lowercased().drop(while: { $0 == "." })
+        let normalizedHost = host.lowercased().drop(while: { $0 == "." })
+        return !normalizedHost.isEmpty && normalizedCookie == normalizedHost
     }
 
     private static func parsePage(pageData: Data) throws -> [SafariCookie] {
@@ -153,7 +176,7 @@ enum SafariBinaryCookies {
         }
 
         let recordSize   = Int(readUInt32LE(data: pageData, offset: base + 0))
-        guard base + recordSize <= pageData.count else {
+        guard recordSize >= 56, base + recordSize <= pageData.count else {
             throw SafariCookiesError.invalidFormat("Cookie record size \(recordSize) exceeds page at offset \(base)")
         }
 
@@ -165,7 +188,7 @@ enum SafariBinaryCookies {
 
         // Dates at base+40 (expiry) and base+48 (creation), Float64 LE, Apple epoch
         let expiry   = readFloat64LE(data: pageData, offset: base + 40)
-        let expiryDate: Date? = expiry > 0
+        let expiryDate: Date? = expiry.isFinite && expiry > 0
             ? Date(timeIntervalSince1970: expiry + appleEpochOffset)
             : nil
 
@@ -207,7 +230,7 @@ enum SafariBinaryCookies {
         recordSize: Int
     ) -> String? {
         let absOffset = base + fieldOffset
-        guard fieldOffset > 0, absOffset < base + recordSize, absOffset < pageData.count else {
+        guard fieldOffset >= 56, absOffset < base + recordSize, absOffset < pageData.count else {
             return nil
         }
         // Find null terminator within record bounds
@@ -216,6 +239,7 @@ enum SafariBinaryCookies {
         while end < maxEnd && pageData[end] != 0 {
             end += 1
         }
+        guard end < maxEnd else { return nil }
         return String(data: pageData[absOffset..<end], encoding: .utf8)
     }
 }

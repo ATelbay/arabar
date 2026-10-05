@@ -17,7 +17,12 @@ enum CookieExpiry {
             cookieName = "__Secure-next-auth.session-token.0"
             fallbackCookieName = "__Secure-next-auth.session-token"
             hosts = ["chatgpt.com", ".chatgpt.com"]
+        case .gemini, .kimi, .glm:
+            return nil
         }
+
+        let enabledKey = provider == .claude ? "cookies.enabled.claude" : "cookies.enabled.openai"
+        guard UserDefaults.standard.bool(forKey: enabledKey) else { return nil }
 
         let browserRaw = UserDefaults.standard.string(forKey: browserKey) ?? "safari"
         let browser = BrowserSource(rawValue: browserRaw) ?? .safari
