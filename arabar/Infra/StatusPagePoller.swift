@@ -55,7 +55,10 @@ enum StatusPagePoller {
         request.httpMethod = "GET"
 
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, urlResponse) = try await URLSession.shared.data(for: request)
+            guard let http = urlResponse as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                throw URLError(.badServerResponse)
+            }
             let response = try JSONDecoder().decode(Response.self, from: data)
 
             let pageURL = response.page.url.flatMap { URL(string: $0) }

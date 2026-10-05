@@ -24,12 +24,21 @@ private struct ClaudeUsage: Decodable {
     let outputTokens: Int?
     let cacheReadInputTokens: Int?
     let cacheCreationInputTokens: Int?
+    let cacheCreation: CacheCreation?
+
+    struct CacheCreation: Decodable {
+        let ephemeral1hInputTokens: Int?
+        enum CodingKeys: String, CodingKey {
+            case ephemeral1hInputTokens = "ephemeral_1h_input_tokens"
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
         case cacheReadInputTokens = "cache_read_input_tokens"
         case cacheCreationInputTokens = "cache_creation_input_tokens"
+        case cacheCreation = "cache_creation"
     }
 }
 
@@ -41,7 +50,6 @@ private struct CacheState: Codable {
     struct FileState: Codable {
         var byteOffset: UInt64
         var mtime: Date
-        var seenMessageIds: Set<String>
     }
 }
 
@@ -61,7 +69,7 @@ final class ClaudeUsageReader: @unchecked Sendable {
 
     // MARK: - Init
 
-    init(lookbackDays: Int = 30) {
+    init(lookbackDays: Int = 30, rootDirs: [URL]? = nil, cacheFile: URL? = nil) {
         self.lookbackDays = lookbackDays
 
         // Candidate root dirs
@@ -72,16 +80,16 @@ final class ClaudeUsageReader: @unchecked Sendable {
             dirs.append(URL(fileURLWithPath: configDir).appendingPathComponent("projects"))
         }
         dirs.append(home.appendingPathComponent(".config/claude/projects"))
-        self.rootDirs = dirs
+        self.rootDirs = rootDirs ?? dirs
 
         // Cache file
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let arabarDir = appSupport.appendingPathComponent("arabar")
-        self.cacheFile = arabarDir.appendingPathComponent("claude_cache.json")
+        self.cacheFile = cacheFile ?? arabarDir.appendingPathComponent("claude_cache.json")
 
         // Load existing cache
         self.cache = CacheState()
-        if let data = try? Data(contentsOf: cacheFile),
+        if let data = try? Data(contentsOf: self.cacheFile),
            let loaded = try? JSONDecoder().decode(CacheState.self, from: data) {
             self.cache = loaded
         }
@@ -152,13 +160,13 @@ final class ClaudeUsageReader: @unchecked Sendable {
 
         var fileState = cache.fileStates[key] ?? CacheState.FileState(
             byteOffset: 0,
-            mtime: currentMtime,
-            seenMessageIds: []
+            mtime: currentMtime
         )
 
         // If file was rewritten (mtime went backwards) or forced reset → restart from 0
-        if resetCache || currentMtime < fileState.mtime {
-            fileState = CacheState.FileState(byteOffset: 0, mtime: currentMtime, seenMessageIds: [])
+        if resetCache || currentMtime < fileState.mtime
+            || (attrs?[.size] as? UInt64 ?? 0) < fileState.byteOffset {
+            fileState = CacheState.FileState(byteOffset: 0, mtime: currentMtime)
         }
 
         guard let handle = try? FileHandle(forReadingFrom: fileURL) else {
@@ -176,7 +184,7 @@ final class ClaudeUsageReader: @unchecked Sendable {
         }
 
         // Read remaining bytes
-        let newData = handle.readDataToEndOfFile()
+        guard let newData = try? handle.readToEnd() else { return [] }
         guard !newData.isEmpty else {
             // Update mtime even if no new data
             fileState.mtime = currentMtime
@@ -184,8 +192,10 @@ final class ClaudeUsageReader: @unchecked Sendable {
             return []
         }
 
-        // Update offset
-        fileState.byteOffset += UInt64(newData.count)
+        // Leave an unfinished line in the file for the next refresh.
+        guard let finalNewline = newData.lastIndex(of: 0x0A) else { return [] }
+        let completeData = newData.prefix(through: finalNewline)
+        fileState.byteOffset += UInt64(completeData.count)
         fileState.mtime = currentMtime
 
         // Infer sessionId from path
@@ -195,9 +205,7 @@ final class ClaudeUsageReader: @unchecked Sendable {
         let cutoff = Date().addingTimeInterval(-Double(lookbackDays) * 86400)
         var events: [UsageEvent] = []
 
-        // Split on newlines, handle trailing newline gracefully
-        // Keep track of incomplete last line → save as unprocessed (not done here: offset already advanced)
-        let lines = splitLines(newData)
+        let lines = completeData.split(separator: 0x0A).map { Data($0) }
 
         for line in lines {
             guard !line.isEmpty else { continue }
@@ -209,21 +217,20 @@ final class ClaudeUsageReader: @unchecked Sendable {
                   let msgId = msg.id,
                   !msgId.isEmpty else { continue }
 
-            // Deduplicate within file
-            if fileState.seenMessageIds.contains(msgId) { continue }
-            fileState.seenMessageIds.insert(msgId)
-
-            let usage = msg.usage
+            // A later assistant record may contain the final usage for this message.
+            // Preserve updates; Aggregator resolves repeated IDs across refreshes.
+            guard let usage = msg.usage else { continue }
             let event = UsageEvent(
                 timestamp: record.timestamp,
                 provider: .claude,
                 model: msg.model ?? "unknown",
                 sessionId: record.sessionId ?? sessionId,
                 messageId: msgId,
-                inputTokens: usage?.inputTokens ?? 0,
-                outputTokens: usage?.outputTokens ?? 0,
-                cacheReadTokens: usage?.cacheReadInputTokens ?? 0,
-                cacheCreationTokens: usage?.cacheCreationInputTokens ?? 0,
+                inputTokens: usage.inputTokens ?? 0,
+                outputTokens: usage.outputTokens ?? 0,
+                cacheReadTokens: usage.cacheReadInputTokens ?? 0,
+                cacheCreationTokens: usage.cacheCreationInputTokens ?? 0,
+                cacheCreation1hTokens: usage.cacheCreation?.ephemeral1hInputTokens,
                 cachedTokens: 0,
                 reasoningTokens: 0
             )
@@ -240,26 +247,9 @@ final class ClaudeUsageReader: @unchecked Sendable {
         do {
             return try Self.decoder.decode(ClaudeRecord.self, from: lineData)
         } catch {
-            if let str = String(data: lineData, encoding: .utf8) {
-                debugLog(claudeJsonlLog, "[ClaudeUsageReader] Parse error: \(error.localizedDescription) — line: \(str.prefix(120))")
-            }
+            debugLog(claudeJsonlLog, "[ClaudeUsageReader] Skipping malformed JSONL record")
             return nil
         }
-    }
-
-    private func splitLines(_ data: Data) -> [Data] {
-        var lines: [Data] = []
-        var start = data.startIndex
-        while let range = data.range(of: Data([0x0A]), in: start..<data.endIndex) {
-            let line = data[start..<range.lowerBound]
-            lines.append(line)
-            start = range.upperBound
-        }
-        // Trailing bytes without newline — still try to parse
-        if start < data.endIndex {
-            lines.append(data[start...])
-        }
-        return lines
     }
 
     /// Extract sessionId from path like:

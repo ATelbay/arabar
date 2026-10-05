@@ -30,44 +30,50 @@ final class Aggregator {
     /// Calculates cost for a single event using Pricing tables.
     /// Returns 0 if model is not found — does not crash.
     static func cost(for event: UsageEvent) -> Double {
+        if let recordedCostUSD = event.recordedCostUSD, recordedCostUSD.isFinite, recordedCostUSD >= 0 {
+            return recordedCostUSD
+        }
+
         let price: Pricing.ModelPrice?
         switch event.provider {
         case .claude:
-            price = Pricing.claudeModels[event.model]
+            price = Pricing.claudePrice(for: event.model)
         case .codex:
-            price = Pricing.openaiModels[event.model]
+            price = Pricing.openAIPrice(for: event.model)
         case .gemini, .kimi, .glm:
-            // Account quotas do not use local token/cost accounting.
+            // Account quota providers do not use local token/cost accounting.
             price = nil
         }
 
-        guard let p = price else { return 0 }
+        guard let modelPrice = price else { return 0 }
 
         var total = 0.0
 
         // Input tokens
-        total += Double(event.inputTokens) * p.inputPerMTok / 1_000_000
+        total += Double(event.inputTokens) * modelPrice.inputPerMTok / 1_000_000
 
         // Output tokens
-        total += Double(event.outputTokens) * p.outputPerMTok / 1_000_000
+        total += Double(event.outputTokens) * modelPrice.outputPerMTok / 1_000_000
 
         switch event.provider {
         case .claude:
             // Cache read (hit)
-            total += Double(event.cacheReadTokens) * p.cachedInputPerMTok / 1_000_000
+            total += Double(event.cacheReadTokens) * modelPrice.cachedInputPerMTok / 1_000_000
 
             // Cache write: prefer 5-minute tier, fall back to 1-hour, then ignore
-            let cacheWritePrice = p.cacheWrite5mPerMTok ?? p.cacheWrite1hPerMTok
+            let cacheWritePrice = modelPrice.cacheWrite5mPerMTok ?? modelPrice.cacheWrite1hPerMTok
             if let cwPrice = cacheWritePrice {
-                total += Double(event.cacheCreationTokens) * cwPrice / 1_000_000
+                let oneHourTokens = min(event.cacheCreationTokens, max(0, event.cacheCreation1hTokens ?? 0))
+                total += Double(event.cacheCreationTokens - oneHourTokens) * cwPrice / 1_000_000
+                total += Double(oneHourTokens) * (modelPrice.cacheWrite1hPerMTok ?? cwPrice) / 1_000_000
             }
 
         case .codex:
             // Cached input tokens
-            total += Double(event.cachedTokens) * p.cachedInputPerMTok / 1_000_000
+            total += Double(event.cachedTokens) * modelPrice.cachedInputPerMTok / 1_000_000
 
             // Reasoning tokens billed at output rate
-            total += Double(event.reasoningTokens) * p.outputPerMTok / 1_000_000
+            total += Double(event.reasoningTokens) * modelPrice.outputPerMTok / 1_000_000
         case .gemini, .kimi, .glm:
             break
         }
@@ -82,9 +88,10 @@ final class Aggregator {
         var seen: [String: UsageEvent] = [:]
         for event in events {
             let key = "\(event.provider.rawValue)-\(event.messageId ?? UUID().uuidString)"
-            if seen[key] == nil {
-                seen[key] = event
+            if let previous = seen[key], previous.totalTokens > event.totalTokens {
+                continue
             }
+            seen[key] = event
         }
         return Array(seen.values)
     }
@@ -124,7 +131,7 @@ final class Aggregator {
     ) -> WindowSnapshot {
         let windowSeconds = TimeInterval(durationHours) * 3600
         let cutoff = now.addingTimeInterval(-windowSeconds)
-        let inWindow = events.filter { $0.timestamp >= cutoff }
+        let inWindow = events.filter { $0.timestamp >= cutoff && $0.timestamp <= now }
 
         guard !inWindow.isEmpty else {
             let (emptyPct, emptySource) = percentUsedWithSource(
@@ -146,13 +153,7 @@ final class Aggregator {
         let resetAt = firstEvent.timestamp.addingTimeInterval(windowSeconds)
 
         let tokensUsed = inWindow.reduce(0) { sum, event in
-            sum
-                + event.inputTokens
-                + event.outputTokens
-                + event.cacheReadTokens
-                + event.cacheCreationTokens
-                + event.cachedTokens
-                + event.reasoningTokens
+            sum + event.totalTokens
         }
 
         let costUSD = inWindow.reduce(0.0) { $0 + Aggregator.cost(for: $1) }

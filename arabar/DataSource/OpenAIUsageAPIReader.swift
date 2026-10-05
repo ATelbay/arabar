@@ -45,6 +45,7 @@ private struct CompletionResult: Decodable {
 final class OpenAIUsageAPIReader {
 
     private let session: URLSession
+    private let keyProvider: () -> String?
     private static let baseURL = "https://api.openai.com/v1/organization/usage/completions"
     private static let maxPages = 50
 
@@ -57,15 +58,17 @@ final class OpenAIUsageAPIReader {
 
     // MARK: - Init
 
-    init(session: URLSession = .shared) {
+    init(session: URLSession = .shared,
+         keyProvider: @escaping () -> String? = { KeychainStore.get(account: KeychainAccount.openaiAdminKey) }) {
         self.session = session
+        self.keyProvider = keyProvider
     }
 
     // MARK: - Public API
 
-    /// Returns last N days of API usage. Each daily bucket per model → one UsageEvent.
+    /// Returns last N days of API usage. Each hourly bucket per model → one UsageEvent.
     /// Throws .missingKey if no Admin key is stored.
-    func fetchEvents(lookbackDays: Int = 30) async throws -> [UsageEvent] {
+    func fetchEvents(lookbackDays: Int = 7) async throws -> [UsageEvent] {
         let key = try resolvedKey()
 
         let now = Date()
@@ -75,8 +78,10 @@ final class OpenAIUsageAPIReader {
         var allEvents: [UsageEvent] = []
         var pageToken: String? = nil
         var pagesRead = 0
+        var seenPages = Set<String>()
 
         repeat {
+            try Task.checkCancellation()
             let (buckets, hasMore, nextPage) = try await fetchPage(
                 key: key,
                 startTime: startTime,
@@ -93,7 +98,7 @@ final class OpenAIUsageAPIReader {
                         model: result.model ?? "unknown",
                         sessionId: result.projectId ?? "default-project",
                         messageId: nil,
-                        inputTokens: result.inputTokens ?? 0,
+                        inputTokens: max(0, (result.inputTokens ?? 0) - (result.inputCachedTokens ?? 0)),
                         outputTokens: result.outputTokens ?? 0,
                         cacheReadTokens: 0,
                         cacheCreationTokens: 0,
@@ -104,10 +109,13 @@ final class OpenAIUsageAPIReader {
                 }
             }
 
-            pageToken = nextPage
             pagesRead += 1
-
             if !hasMore { break }
+            guard let nextPage, !nextPage.isEmpty,
+                  seenPages.insert(nextPage).inserted, pagesRead < Self.maxPages else {
+                throw OpenAIUsageAPIError.parsingFailed("Invalid or excessive pagination")
+            }
+            pageToken = nextPage
         } while pagesRead < Self.maxPages
 
         return allEvents
@@ -115,7 +123,7 @@ final class OpenAIUsageAPIReader {
 
     /// Returns a human-readable status string for the Settings UI.
     func testConnection() async -> String {
-        guard let key = KeychainStore.get(account: KeychainAccount.openaiAdminKey),
+        guard let key = keyProvider(),
               !key.isEmpty else {
             return "No Admin key configured"
         }
@@ -147,7 +155,7 @@ final class OpenAIUsageAPIReader {
     // MARK: - Private helpers
 
     private func resolvedKey() throws -> String {
-        guard let key = KeychainStore.get(account: KeychainAccount.openaiAdminKey),
+        guard let key = keyProvider(),
               !key.isEmpty else {
             throw OpenAIUsageAPIError.missingKey
         }
@@ -165,9 +173,10 @@ final class OpenAIUsageAPIReader {
         var queryItems: [URLQueryItem] = [
             URLQueryItem(name: "start_time", value: "\(startTime)"),
             URLQueryItem(name: "end_time", value: "\(endTime)"),
-            URLQueryItem(name: "bucket_width", value: "1d"),
+            // Hourly buckets (max 168 per page) so the 5h window has real resolution.
+            URLQueryItem(name: "bucket_width", value: "1h"),
             URLQueryItem(name: "group_by[]", value: "model"),
-            URLQueryItem(name: "limit", value: "180")
+            URLQueryItem(name: "limit", value: "168")
         ]
         if let token = pageToken {
             queryItems.append(URLQueryItem(name: "page", value: token))
@@ -194,7 +203,10 @@ final class OpenAIUsageAPIReader {
             throw OpenAIUsageAPIError.httpError(0, error.localizedDescription)
         }
 
-        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OpenAIUsageAPIError.parsingFailed("Non-HTTP response")
+        }
+        if httpResponse.statusCode != 200 {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw OpenAIUsageAPIError.httpError(httpResponse.statusCode, body)
         }

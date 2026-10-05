@@ -41,4 +41,24 @@ final class ClaudeCookiesReaderParsingTests: XCTestCase {
         XCTAssertNil(window.percentUsed)
         XCTAssertNil(window.resetAt)
     }
+
+    func testBrowserActiveOrganizationWinsOverFirstChatOrganization() {
+        let orgs: [[String: Any]] = [
+            ["uuid": "11111111-1111-1111-1111-111111111111", "capabilities": ["chat"]],
+            ["uuid": "22222222-2222-2222-2222-222222222222", "capabilities": ["chat", "claude_max"]],
+        ]
+        XCTAssertEqual(
+            ClaudeCookiesReader.selectOrganization(from: orgs, preferredOrgId: "22222222-2222-2222-2222-222222222222"),
+            "22222222-2222-2222-2222-222222222222"
+        )
+        // A stale cookie for an org the session no longer belongs to falls back to the old rule.
+        XCTAssertEqual(
+            ClaudeCookiesReader.selectOrganization(from: orgs, preferredOrgId: "33333333-3333-3333-3333-333333333333"),
+            "11111111-1111-1111-1111-111111111111"
+        )
+        XCTAssertEqual(
+            ClaudeCookiesReader.selectOrganization(from: orgs, preferredOrgId: nil),
+            "11111111-1111-1111-1111-111111111111"
+        )
+    }
 }

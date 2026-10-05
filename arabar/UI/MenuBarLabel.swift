@@ -89,7 +89,7 @@ struct MenuBarLabel: View {
                 } else {
                     Text("ukwn")
                         .foregroundColor(.secondary)
-                        .help(viewModel.accountQuotaErrors[provider] ?? "Connect your account in Settings → Account limits.")
+                        .help(viewModel.accountQuotaErrors[provider] ?? "Connect your account in Settings → Providers.")
                 }
             } else {
                 logoImage(named: logoName, size: 11)

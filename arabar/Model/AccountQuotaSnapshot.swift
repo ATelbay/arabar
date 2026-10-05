@@ -34,14 +34,22 @@ struct AccountQuotaConfiguration: Equatable {
     let region: String
     let project: String
     let revision: Int
+    /// Gemini only: "cli" (Gemini CLI sign-in) or "agy" (Antigravity CLI sign-in).
+    var source: String = GeminiQuotaSource.cli
 
     static func load(provider: Provider, defaults: UserDefaults = .standard) -> Self {
         let prefix = "quota.\(provider.rawValue)"
         return Self(provider: provider, enabled: defaults.bool(forKey: "\(prefix).enabled"),
                     region: defaults.string(forKey: "\(prefix).region") ?? "global",
                     project: defaults.string(forKey: "\(prefix).project") ?? "",
-                    revision: defaults.integer(forKey: "\(prefix).revision"))
+                    revision: defaults.integer(forKey: "\(prefix).revision"),
+                    source: defaults.string(forKey: "\(prefix).source") ?? GeminiQuotaSource.cli)
     }
 
     var keychainAccount: String { "quota.key.\(provider.rawValue)" }
+}
+
+enum GeminiQuotaSource {
+    static let cli = "cli"
+    static let antigravity = "agy"
 }

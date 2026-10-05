@@ -37,7 +37,19 @@ private struct UsageBucket: Decodable {
 
 private struct UsageRow: Decodable {
     let uncachedInputTokens: Int
-    let cacheCreationInputTokens: Int
+    let cacheCreation: CacheCreation
+    var cacheCreationInputTokens: Int {
+        cacheCreation.ephemeral5mInputTokens + cacheCreation.ephemeral1hInputTokens
+    }
+
+    struct CacheCreation: Decodable {
+        let ephemeral5mInputTokens: Int
+        let ephemeral1hInputTokens: Int
+        enum CodingKeys: String, CodingKey {
+            case ephemeral5mInputTokens = "ephemeral_5m_input_tokens"
+            case ephemeral1hInputTokens = "ephemeral_1h_input_tokens"
+        }
+    }
     let cacheReadInputTokens: Int
     let outputTokens: Int
     let model: String
@@ -46,7 +58,7 @@ private struct UsageRow: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case uncachedInputTokens = "uncached_input_tokens"
-        case cacheCreationInputTokens = "cache_creation_input_tokens"
+        case cacheCreation = "cache_creation"
         case cacheReadInputTokens = "cache_read_input_tokens"
         case outputTokens = "output_tokens"
         case model
@@ -60,6 +72,7 @@ private struct UsageRow: Decodable {
 final class AnthropicAdminAPIReader {
 
     private let session: URLSession
+    private let keyProvider: () -> String?
 
     private static let decoder: JSONDecoder = .iso8601Flexible
 
@@ -71,8 +84,10 @@ final class AnthropicAdminAPIReader {
 
     // MARK: - Init
 
-    init(session: URLSession = .shared) {
+    init(session: URLSession = .shared,
+         keyProvider: @escaping () -> String? = { KeychainStore.get(account: KeychainAccount.anthropicAdminKey) }) {
         self.session = session
+        self.keyProvider = keyProvider
     }
 
     // MARK: - Public API
@@ -80,8 +95,8 @@ final class AnthropicAdminAPIReader {
     /// Returns last N days of API usage as a flat array of UsageEvent.
     /// Each Anthropic usage_report row gets mapped to one UsageEvent.
     /// Throws .missingKey if no Admin key in Keychain (= opt-out).
-    func fetchEvents(lookbackDays: Int = 30) async throws -> [UsageEvent] {
-        guard let key = KeychainStore.get(account: KeychainAccount.anthropicAdminKey), !key.isEmpty else {
+    func fetchEvents(lookbackDays: Int = 7) async throws -> [UsageEvent] {
+        guard let key = keyProvider(), !key.isEmpty else {
             throw AnthropicAdminAPIError.missingKey
         }
 
@@ -90,8 +105,10 @@ final class AnthropicAdminAPIReader {
         var allEvents: [UsageEvent] = []
         var nextPage: String? = nil
         var keepFetching = true
+        var seenPages = Set<String>()
 
         while keepFetching {
+            try Task.checkCancellation()
             let response = try await fetchPage(
                 key: key,
                 startingAt: startDate,
@@ -106,7 +123,11 @@ final class AnthropicAdminAPIReader {
                 }
             }
 
-            if response.hasMore, let page = response.nextPage, !page.isEmpty {
+            if response.hasMore {
+                guard let page = response.nextPage, !page.isEmpty,
+                      seenPages.insert(page).inserted, seenPages.count < 50 else {
+                    throw AnthropicAdminAPIError.parsingFailed("Invalid or excessive pagination")
+                }
                 nextPage = page
             } else {
                 keepFetching = false
@@ -118,7 +139,7 @@ final class AnthropicAdminAPIReader {
 
     /// Settings UI hook. Returns status string for display in preferences.
     func testConnection() async -> String {
-        guard let key = KeychainStore.get(account: KeychainAccount.anthropicAdminKey), !key.isEmpty else {
+        guard let key = keyProvider(), !key.isEmpty else {
             return "No Admin key configured"
         }
 
@@ -157,7 +178,10 @@ final class AnthropicAdminAPIReader {
             URLQueryItem(name: "ending_at",   value: Self.isoFormatter.string(from: endingAt)),
             URLQueryItem(name: "group_by[]",  value: "workspace_id"),
             URLQueryItem(name: "group_by[]",  value: "model"),
-            URLQueryItem(name: "bucket_width", value: "1d")
+            // Hourly buckets: the 5h window needs sub-day resolution. With daily buckets
+            // stamped at 00:00 UTC the 5h window was empty for 19 hours of every day.
+            URLQueryItem(name: "bucket_width", value: "1h"),
+            URLQueryItem(name: "limit", value: "168")
         ]
         if let page = nextPage {
             queryItems.append(URLQueryItem(name: "page", value: page))
@@ -205,6 +229,7 @@ final class AnthropicAdminAPIReader {
             outputTokens: row.outputTokens,
             cacheReadTokens: row.cacheReadInputTokens,
             cacheCreationTokens: row.cacheCreationInputTokens,
+            cacheCreation1hTokens: row.cacheCreation.ephemeral1hInputTokens,
             cachedTokens: 0,
             reasoningTokens: 0
         )

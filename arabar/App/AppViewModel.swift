@@ -5,8 +5,8 @@ import Combine
 @MainActor
 final class AppViewModel: ObservableObject {
     // MARK: - Primary snapshots (shown in menubar & main section)
-    @Published var claudeSnapshot: UsageSnapshot?       // subscription source (cookies or JSONL); overridden to api if display.source.claude == "api"
-    @Published var codexSnapshot: UsageSnapshot?        // same for codex
+    @Published var claudeSnapshot: UsageSnapshot?       // subscription source (cookies + JSONL)
+    @Published var codexSnapshot: UsageSnapshot?        // subscription source (cookies + JSONL)
     @Published var accountQuotas: [Provider: AccountQuotaSnapshot] = [:]
     @Published var accountQuotaErrors: [Provider: String] = [:]
     private let accountQuotaReader = AccountQuotaReader()
@@ -14,10 +14,15 @@ final class AppViewModel: ObservableObject {
 
     func snapshot(for provider: Provider) -> UsageSnapshot? {
         switch provider {
-        case .claude: return claudeSnapshot
-        case .codex: return codexSnapshot
+        case .claude: return usesAPIDisplay(for: provider) ? claudeApiSnapshot : claudeSnapshot
+        case .codex: return usesAPIDisplay(for: provider) ? codexApiSnapshot : codexSnapshot
         case .gemini, .kimi, .glm: return nil
         }
+    }
+
+    func usesAPIDisplay(for provider: Provider) -> Bool {
+        let key = provider == .claude ? "display.source.claude" : "display.source.openai"
+        return !provider.usesAccountQuota && UserDefaults.standard.string(forKey: key) == "api"
     }
 
     func status(for provider: Provider) -> StatusInfo? {
@@ -55,6 +60,8 @@ final class AppViewModel: ObservableObject {
 
     private let claudeReader = ClaudeUsageReader()
     private let codexReader = CodexUsageReader()
+    private let claudePiReader = PiUsageReader(targetProvider: .claude)
+    private let codexPiReader = PiUsageReader(targetProvider: .codex)
     private let aggregator = Aggregator()
 
     // Hoisted cookie readers — avoid re-allocating on every refresh
@@ -62,9 +69,12 @@ final class AppViewModel: ObservableObject {
     private let openaiCookieReader = OpenAICookiesReader()
 
     private var eventBuffer: [UsageEvent] = []
-    private var isBufferLoaded: Bool = false
+    private var bufferLoadTask: Task<[UsageEvent], Never>?
+    private let bufferWriteQueue = DispatchQueue(label: "arabar.event-buffer")
     // Per-provider rebuild tracking to avoid race when both providers run in parallel
     private var initialRebuildDone: Set<Provider> = []
+    private var pendingRebuilds: Set<Provider> = []
+    private var localReadFailures: Set<Provider> = []
     private let bufferRetentionHours: Double = 192  // 168h week + 24h safety
 
     // Sticky-snapshot invalidation: track last-known cookies-enabled state
@@ -72,6 +82,7 @@ final class AppViewModel: ObservableObject {
     private var lastOpenAICookiesEnabled: Bool
     private var lastClaudeCookieSource: String
     private var lastOpenAICookieSource: String
+    private var apiKeyRevisions: [String: Int] = [:]
     private var settingsRevision: Int = 0
     private var cancellables: Set<AnyCancellable> = []
 
@@ -85,7 +96,7 @@ final class AppViewModel: ObservableObject {
             at: dir,
             withIntermediateDirectories: true
         )
-        return dir.appendingPathComponent("event_buffer.json")
+        return dir.appendingPathComponent("event_buffer_v2.json")
     }()
 
     init() {
@@ -93,13 +104,12 @@ final class AppViewModel: ObservableObject {
         lastOpenAICookiesEnabled = UserDefaults.standard.bool(forKey: "cookies.enabled.openai")
         lastClaudeCookieSource = UserDefaults.standard.string(forKey: "cookies.source.claude") ?? "safari"
         lastOpenAICookieSource = UserDefaults.standard.string(forKey: "cookies.source.openai") ?? "safari"
+        for account in [KeychainAccount.anthropicAdminKey, KeychainAccount.openaiAdminKey] {
+            apiKeyRevisions[account] = UserDefaults.standard.integer(forKey: "\(account).revision")
+        }
         let url = bufferFile
-        Task.detached(priority: .userInitiated) {
-            let loaded = Self.loadBufferFromDisk(url: url)
-            await MainActor.run { [weak self] in
-                self?.eventBuffer = loaded
-                self?.isBufferLoaded = true
-            }
+        bufferLoadTask = Task.detached(priority: .userInitiated) {
+            Self.loadBufferFromDisk(url: url)
         }
 
         // Rotation timer (30s) — drives menubar provider cycling
@@ -111,8 +121,19 @@ final class AppViewModel: ObservableObject {
 
         // Invalidate sticky snapshots when the user toggles cookies in Settings
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 guard let self else { return }
+                self.objectWillChange.send()
+                for account in [KeychainAccount.anthropicAdminKey, KeychainAccount.openaiAdminKey] {
+                    let revision = UserDefaults.standard.integer(forKey: "\(account).revision")
+                    if self.apiKeyRevisions[account] != revision {
+                        self.apiKeyRevisions[account] = revision
+                        self.settingsRevision &+= 1
+                        if account == KeychainAccount.anthropicAdminKey { self.claudeApiSnapshot = nil }
+                        else { self.codexApiSnapshot = nil }
+                    }
+                }
                 for provider in Provider.accountQuotaProviders {
                     let configuration = AccountQuotaConfiguration.load(provider: provider)
                     if self.quotaConfigurations[provider] != configuration {
@@ -128,12 +149,16 @@ final class AppViewModel: ObservableObject {
                 if self.lastClaudeCookiesEnabled != cookiesClaudeOn || self.lastClaudeCookieSource != claudeSource {
                     self.settingsRevision &+= 1
                     self.claudeSnapshot = nil
+                    self.claudeSessionExpired = false
+                    self.claudeCookieExpiresAt = nil
                     self.lastClaudeCookiesEnabled = cookiesClaudeOn
                     self.lastClaudeCookieSource = claudeSource
                 }
                 if self.lastOpenAICookiesEnabled != cookiesOpenAIOn || self.lastOpenAICookieSource != openAISource {
                     self.settingsRevision &+= 1
                     self.codexSnapshot = nil
+                    self.codexSessionExpired = false
+                    self.codexCookieExpiresAt = nil
                     self.lastOpenAICookiesEnabled = cookiesOpenAIOn
                     self.lastOpenAICookieSource = openAISource
                 }
@@ -147,12 +172,11 @@ final class AppViewModel: ObservableObject {
         guard !isRefreshing else { return }
         isRefreshing = true
         lastError = nil
+        localReadFailures.removeAll()
         defer { isRefreshing = false }
 
         let now = Date()
         let revisionAtStart = settingsRevision
-        let claudeDisplaySource = UserDefaults.standard.string(forKey: "display.source.claude") ?? "subscription"
-        let codexDisplaySource  = UserDefaults.standard.string(forKey: "display.source.openai") ?? "subscription"
 
         // Run all sources in parallel
         async let claudeSubTask  = computeSubscriptionSnapshot(provider: .claude, now: now)
@@ -195,17 +219,13 @@ final class AppViewModel: ObservableObject {
             self.lastRefreshAt = now
         }
 
-        // Update cookie expiry dates for TTL warning UX
-        // CookieExpiry.forProvider is pure sync — structured Task is fine here
-        self.claudeCookieExpiresAt = await Task { CookieExpiry.forProvider(.claude) }.value
-        self.codexCookieExpiresAt  = await Task { CookieExpiry.forProvider(.codex) }.value
-
-        // Override primary snapshot to API tier if user selected "api" as display source
-        if claudeDisplaySource == "api", let apiSnap = claudeApiSnapshot {
-            self.claudeSnapshot = apiSnap
-        }
-        if codexDisplaySource == "api", let apiSnap = codexApiSnapshot {
-            self.codexSnapshot = apiSnap
+        // Reading browser databases can block; only inspect them after explicit opt-in.
+        async let claudeExpiry = Task.detached { CookieExpiry.forProvider(.claude) }.value
+        async let codexExpiry = Task.detached { CookieExpiry.forProvider(.codex) }.value
+        let expiryDates = await (claudeExpiry, codexExpiry)
+        if settingsRevision == revisionAtStart {
+            self.claudeCookieExpiresAt = expiryDates.0
+            self.codexCookieExpiresAt = expiryDates.1
         }
     }
 
@@ -222,8 +242,10 @@ final class AppViewModel: ObservableObject {
     /// so the fix is a re-login rather than a transient retry.
     private static func isSessionExpiredError(_ error: Error) -> Bool {
         if case OpenAICookiesError.sessionExchangeFailed = error { return true }
-        if case OpenAICookiesError.httpError(let c) = error, c == 401 || c == 403 { return true }
-        if case ClaudeCookiesError.httpError(let c) = error, c == 401 || c == 403 { return true }
+        if case OpenAICookiesError.httpError(let statusCode) = error,
+           statusCode == 401 || statusCode == 403 { return true }
+        if case ClaudeCookiesError.httpError(let statusCode) = error,
+           statusCode == 401 || statusCode == 403 { return true }
         return false
     }
 
@@ -233,19 +255,7 @@ final class AppViewModel: ObservableObject {
     /// authoritative data, keep the current one briefly to avoid flicker.
     /// Expired authoritative sticky snapshots must not mask a newer JSONL/unknown fallback.
     private func preferUseful(new: UsageSnapshot?, current: UsageSnapshot?, now: Date) -> UsageSnapshot? {
-        guard let current = current else { return new }
-        if isUseful(new, now: now) { return new }
-        if isUseful(current, now: now) { return current }
-        if new == nil, SnapshotFreshnessPolicy.hasAuthoritativeData(current) {
-            // Keep expired authoritative context only when there is no fallback at all;
-            // UI suppresses its percent and marks it expired.
-            return current
-        }
-        return new
-    }
-
-    private func isUseful(_ snap: UsageSnapshot?, now: Date) -> Bool {
-        SnapshotFreshnessPolicy.hasDisplayableAuthoritativeData(snap, now: now)
+        SubscriptionSnapshotPolicy.preferUseful(new: new, current: current, now: now)
     }
 
     // MARK: - Subscription source: cookies → JSONL fallback
@@ -272,7 +282,7 @@ final class AppViewModel: ObservableObject {
                 return SnapshotRefreshResult(
                     snapshot: mergedSnapshot(cookies: cookiesSnap, jsonl: jsonlSnap),
                     didRefreshSource: true,
-                    didFailSource: false
+                    didFailSource: localReadFailures.contains(provider)
                 )
             } catch {
                 // Non-fatal: fall through to JSONL result already computing, but do not
@@ -293,7 +303,7 @@ final class AppViewModel: ObservableObject {
         return SnapshotRefreshResult(
             snapshot: jsonlSnap,
             didRefreshSource: jsonlSnap != nil,
-            didFailSource: false
+            didFailSource: localReadFailures.contains(provider)
         )
     }
 
@@ -333,9 +343,9 @@ final class AppViewModel: ObservableObject {
             let events: [UsageEvent]
             switch provider {
             case .claude:
-                events = try await AnthropicAdminAPIReader().fetchEvents(lookbackDays: 30)
+                events = try await AnthropicAdminAPIReader().fetchEvents(lookbackDays: 7)
             case .codex:
-                events = try await OpenAIUsageAPIReader().fetchEvents(lookbackDays: 30)
+                events = try await OpenAIUsageAPIReader().fetchEvents(lookbackDays: 7)
             case .gemini, .kimi, .glm:
                 return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
             }
@@ -355,6 +365,7 @@ final class AppViewModel: ObservableObject {
         } catch OpenAIUsageAPIError.disabled {
             return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: false)
         } catch {
+            lastError = "\(provider) API: \(error.localizedDescription)"
             return SnapshotRefreshResult(snapshot: nil, didRefreshSource: false, didFailSource: true)
         }
     }
@@ -391,29 +402,48 @@ final class AppViewModel: ObservableObject {
     }
 
     private func jsonlSnapshot(for provider: Provider, now: Date) async -> UsageSnapshot? {
-        guard isBufferLoaded else { return nil }
-        let needsRebuild = eventBuffer.isEmpty && !initialRebuildDone.contains(provider)
+        if let loadTask = bufferLoadTask {
+            let loaded = await loadTask.value
+            // Both providers may await the same load. Apply it once before appending deltas.
+            if bufferLoadTask != nil {
+                eventBuffer = loaded
+                bufferLoadTask = nil
+            }
+        }
+        let hasBufferedEvents = eventBuffer.contains { $0.provider == provider }
+        let needsRebuild = pendingRebuilds.contains(provider) || (!hasBufferedEvents && !initialRebuildDone.contains(provider))
+        if needsRebuild { pendingRebuilds.insert(provider) }
         initialRebuildDone.insert(provider)
 
-        let newEvents: [UsageEvent]
-        do {
-            switch provider {
-            case .claude:
-                let reader = claudeReader
-                newEvents = try await Task.detached(priority: .userInitiated) {
-                    needsRebuild ? try reader.rebuildAll() : try reader.fetchNewEvents()
-                }.value
-            case .codex:
-                let reader = codexReader
-                newEvents = try await Task.detached(priority: .userInitiated) {
-                    needsRebuild ? try reader.rebuildAll() : try reader.fetchNewEvents()
-                }.value
-            case .gemini, .kimi, .glm:
-                return nil
-            }
-        } catch {
-            self.lastError = "\(provider) JSONL: \(error.localizedDescription)"
+        let read: ([UsageEvent], [String])
+        switch provider {
+        case .claude:
+            let reader = claudeReader
+            let piReader = claudePiReader
+            read = await Task.detached(priority: .userInitiated) {
+                Self.readLocalSources([
+                    { needsRebuild ? try reader.rebuildAll() : try reader.fetchNewEvents() },
+                    { needsRebuild ? try piReader.rebuildAll() : try piReader.fetchNewEvents() }
+                ])
+            }.value
+        case .codex:
+            let reader = codexReader
+            let piReader = codexPiReader
+            read = await Task.detached(priority: .userInitiated) {
+                Self.readLocalSources([
+                    { needsRebuild ? try reader.rebuildAll() : try reader.fetchNewEvents() },
+                    { needsRebuild ? try piReader.rebuildAll() : try piReader.fetchNewEvents() }
+                ])
+            }.value
+        case .gemini, .kimi, .glm:
             return nil
+        }
+        let newEvents = read.0
+        if read.1.isEmpty {
+            pendingRebuilds.remove(provider)
+        } else {
+            localReadFailures.insert(provider)
+            lastError = "\(provider) JSONL: " + read.1.joined(separator: "; ")
         }
 
         eventBuffer.append(contentsOf: newEvents)
@@ -423,6 +453,16 @@ final class AppViewModel: ObservableObject {
         let filtered = eventBuffer.filter { $0.provider == provider }
         let snapshots = aggregator.aggregate(events: filtered, now: now)
         return snapshots[provider]
+    }
+
+    nonisolated static func readLocalSources(_ sources: [() throws -> [UsageEvent]]) -> ([UsageEvent], [String]) {
+        var events: [UsageEvent] = []
+        var errors: [String] = []
+        for read in sources {
+            do { events.append(contentsOf: try read()) }
+            catch { errors.append(error.localizedDescription) }
+        }
+        return (events, errors)
     }
 
     // MARK: - Buffer management
@@ -443,10 +483,9 @@ final class AppViewModel: ObservableObject {
     }
 
     private func saveBuffer() {
-        guard !eventBuffer.isEmpty else { return }
         let snapshot = eventBuffer
         let url = bufferFile
-        Task.detached(priority: .background) {
+        bufferWriteQueue.async {
             do {
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601

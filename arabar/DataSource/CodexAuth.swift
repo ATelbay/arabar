@@ -16,13 +16,18 @@ enum CodexAuth {
     static func read() -> CodexAuthInfo? {
         let authURL = codexHome().appendingPathComponent("auth.json")
         guard let data = try? Data(contentsOf: authURL) else { return nil }
+        return parse(data: data)
+    }
+
+    static func parse(data: Data) -> CodexAuthInfo? {
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return nil
         }
 
-        let accessToken  = obj["access_token"] as? String
-        let accountId    = obj["account_id"] as? String
-        let expiresAt    = parseExpiresAt(obj["expires_at"])
+        let tokens = obj["tokens"] as? [String: Any] ?? obj
+        let accessToken = tokens["access_token"] as? String
+        let accountId = tokens["account_id"] as? String
+        let expiresAt = parseExpiresAt(tokens["expires_at"] ?? obj["expires_at"])
 
         // Return nil only if every field is nil (file existed but was empty/unexpected)
         if accessToken == nil, accountId == nil, expiresAt == nil { return nil }
@@ -32,7 +37,7 @@ enum CodexAuth {
     // MARK: - Helpers
 
     static func codexHome() -> URL {
-        if let env = ProcessInfo.processInfo.environment["CODEX_HOME"] {
+        if let env = ProcessInfo.processInfo.environment["CODEX_HOME"], !env.isEmpty {
             return URL(fileURLWithPath: env)
         }
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")

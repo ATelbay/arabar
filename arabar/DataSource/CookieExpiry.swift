@@ -21,6 +21,9 @@ enum CookieExpiry {
             return nil
         }
 
+        let enabledKey = provider == .claude ? "cookies.enabled.claude" : "cookies.enabled.openai"
+        guard UserDefaults.standard.bool(forKey: enabledKey) else { return nil }
+
         let browserRaw = UserDefaults.standard.string(forKey: browserKey) ?? "safari"
         let browser = BrowserSource(rawValue: browserRaw) ?? .safari
 

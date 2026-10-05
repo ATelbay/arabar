@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 
 @MainActor
 final class MenuBarController: NSObject {
@@ -7,7 +8,7 @@ final class MenuBarController: NSObject {
     private let statusItem: NSStatusItem
     private let popover: NSPopover
     private var hostingView: NSHostingView<MenuBarLabel>?
-    private var sizeObservation: NSKeyValueObservation?
+    private var sizeCancellables: Set<AnyCancellable> = []
 
     init(viewModel: AppViewModel) {
         self.viewModel = viewModel
@@ -33,10 +34,19 @@ final class MenuBarController: NSObject {
 
         // Drive status-item width from SwiftUI's intrinsic size. Without this the button
         // stays at default width and the percent text gets clipped.
+        // `fittingSize` is not KVO-observable, so re-measure whenever the label's inputs
+        // change: view-model publishes (percent, rotation) and @AppStorage visibility toggles.
+        // objectWillChange fires before SwiftUI re-renders, hence the hop to the next run loop.
         updateLength()
-        sizeObservation = hosting.observe(\.fittingSize, options: [.new]) { [weak self] _, _ in
-            Task { @MainActor in self?.updateLength() }
-        }
+        viewModel.objectWillChange
+            .merge(with: NotificationCenter.default
+                .publisher(for: UserDefaults.didChangeNotification)
+                .map { _ in () })
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.updateLength() }
+            }
+            .store(in: &sizeCancellables)
 
         button.target = self
         button.action = #selector(handleClick(_:))
@@ -45,8 +55,8 @@ final class MenuBarController: NSObject {
 
     private func updateLength() {
         guard let hosting = hostingView else { return }
-        let width = max(hosting.fittingSize.width, 24)
-        statusItem.length = width
+        let width = max(hosting.fittingSize.width.rounded(.up), 24)
+        if statusItem.length != width { statusItem.length = width }
     }
 
     private func configurePopover() {

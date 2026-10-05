@@ -47,6 +47,21 @@ final class AccountQuotaTests: XCTestCase {
         XCTAssertEqual(snapshot.windows.map(\.remainingFraction), [0, 0.4])
     }
 
+    func testKimiResponseWithBothShapesIsNotDoubleCounted() throws {
+        let snapshot = try parse(#"{"usages":{"limit_5h":{"used_ratio":0},"limit_7d":{"used_ratio":0}},"usage":{"used":"0","limit":"100"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","used":"0"}}]}"#, .kimi)
+        XCTAssertEqual(snapshot.windows.map(\.label), ["5h", "Weekly"])
+    }
+
+    func testKimiParsesCurrentManagedUsagesShape() throws {
+        let snapshot = try parse(#"{"usages":{"limit_5h":{"used_ratio":0.25,"reset_time":"2030-01-01T00:00:00Z"},"limit_7d":{"used_ratio":"0.9"},"limit_month_code":{"used_ratio":7}},"boosterWallet":null}"#, .kimi)
+        XCTAssertEqual(snapshot.windows.map(\.label), ["5h", "Weekly"])
+        XCTAssertEqual(snapshot.windows[0].remainingFraction, 0.75, accuracy: 1e-9)
+        XCTAssertEqual(snapshot.windows[1].remainingFraction, 0.1, accuracy: 1e-9)
+        XCTAssertNotNil(snapshot.windows[0].resetAt)
+        // An out-of-range ratio is dropped rather than turned into a fabricated quota.
+        XCTAssertFalse(snapshot.windows.contains { $0.id == "limit_month_code" })
+    }
+
     func testGLMConvertsPercentUsedAndKeepsDistinctQuotas() throws {
         let snapshot = try parse(#"{"code":200,"success":true,"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":1.5,"nextResetTime":1893456000000},{"type":"CREDIT_LIMIT","unit":6,"number":1,"percentage":65},{"type":"TIME_LIMIT","percentage":80}]}}"#, .glm)
         XCTAssertEqual(snapshot.windows.map(\.label), ["5h", "1w", "Monthly tools"])
@@ -119,6 +134,75 @@ final class AccountQuotaTests: XCTestCase {
         })
         _ = try await reader.fetchKeyQuota(provider: .kimi, key: "test-key", region: "global")
         _ = try await reader.fetchKeyQuota(provider: .glm, key: "test-key", region: "china")
+    }
+
+    func testKimiCLIConfigSelectsCredentialFileAndBaseURL() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = home.appendingPathComponent(".kimi-code/credentials")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try """
+        [providers."managed:kimi-code"]
+        type = "kimi"
+        base_url = "https://api.kimi.ai/coding/v1/"
+
+        [providers."managed:kimi-code".oauth]
+        storage = "file"
+        key = "../../kimi-code-env-abc"
+        """.write(to: home.appendingPathComponent(".kimi-code/config.toml"), atomically: true, encoding: .utf8)
+        try "mainland-cn".write(to: home.appendingPathComponent(".kimi-code/region"), atomically: true, encoding: .utf8)
+        let expiry = Date().addingTimeInterval(600).timeIntervalSince1970
+        try #"{"access_token":"cli-token","expires_at":\#(Int(expiry))}"#
+            .write(to: root.appendingPathComponent("kimi-code-env-abc.json"), atomically: true, encoding: .utf8)
+
+        let auth = try XCTUnwrap(KimiCodeCLIAuth.load(home: home))
+        // Explicit base_url wins over the region file; the key cannot escape credentials/.
+        XCTAssertEqual(auth.baseURL, "https://api.kimi.ai/coding/v1")
+        XCTAssertEqual(auth.validToken(), "cli-token")
+        XCTAssertNil(auth.validToken(now: Date().addingTimeInterval(3600)))
+        XCTAssertNil(KimiCodeCLIAuth.load(home: home.appendingPathComponent("missing")))
+    }
+
+    func testKimiPrefersLiveCLITokenAndFallsBackToKey() async throws {
+        let live = KimiCodeCLIAuth(baseURL: "https://api.kimi.ai/coding/v1", accessToken: "cli-token",
+                                   expiresAt: Date().addingTimeInterval(600))
+        var seen: [String?] = []
+        let session = makeSession { request in
+            seen.append(request.value(forHTTPHeaderField: "Authorization"))
+            XCTAssertEqual(request.url?.host, "api.kimi.ai")
+            return (200, #"{"usages":{"limit_7d":{"used_ratio":0.5}}}"#)
+        }
+        let configuration = AccountQuotaConfiguration(provider: .kimi, enabled: true, region: "global", project: "", revision: 0)
+
+        let viaCLI = AccountQuotaReader(session: session, readKimiCLI: { live }, readKey: { _ in "api-key" })
+        _ = try await viaCLI.fetch(configuration: configuration)
+        let expired = KimiCodeCLIAuth(baseURL: live.baseURL, accessToken: "old", expiresAt: Date().addingTimeInterval(-60))
+        let viaKey = AccountQuotaReader(session: session, readKimiCLI: { expired }, readKey: { _ in "api-key" })
+        _ = try await viaKey.fetch(configuration: configuration)
+        XCTAssertEqual(seen, ["Bearer cli-token", "Bearer api-key"])
+
+        let idle = AccountQuotaReader(session: session, readKimiCLI: { expired }, readKey: { _ in nil })
+        do {
+            _ = try await idle.fetch(configuration: configuration)
+            XCTFail("expected kimiCLITokenExpired")
+        } catch AccountQuotaError.kimiCLITokenExpired {}
+        XCTAssertEqual(seen.count, 2, "an expired CLI token must never be sent")
+    }
+
+    func testGeminiFindsOAuthConfigurationInBundleChunks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let bundle = root.appendingPathComponent("bundle")
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "import './chunk-B.js';".write(to: bundle.appendingPathComponent("gemini.js"), atomically: true, encoding: .utf8)
+        try "var x = 1;".write(to: bundle.appendingPathComponent("chunk-A.js"), atomically: true, encoding: .utf8)
+        try #"var OAUTH_CLIENT_ID = "chunk-id"; var OAUTH_CLIENT_SECRET = "chunk-secret";"#
+            .write(to: bundle.appendingPathComponent("chunk-B.js"), atomically: true, encoding: .utf8)
+
+        let chunks = GeminiOAuthClient.bundleChunks(under: [root])
+        XCTAssertEqual(chunks.map(\.lastPathComponent), ["chunk-A.js", "chunk-B.js"])
+        let client = try GeminiOAuthClient.load(credentials: [:], candidateFiles: chunks)
+        XCTAssertEqual(client.id, "chunk-id")
     }
 
     func testUnauthorizedHTTPResponseDoesNotParseQuota() async {

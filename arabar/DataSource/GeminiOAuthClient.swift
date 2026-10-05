@@ -2,7 +2,7 @@ import Foundation
 
 /// Resolves the public installed-app OAuth configuration from the user's Gemini CLI.
 /// Client identifiers are not embedded in arabar or fetched from an unrelated service.
-struct GeminiOAuthClient {
+struct GeminiOAuthClient: Equatable {
     let id: String
     let secret: String
 
@@ -15,6 +15,7 @@ struct GeminiOAuthClient {
             guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
                   size < 20_000_000,
                   let source = try? String(contentsOf: file, encoding: .utf8),
+                  source.contains("OAUTH_CLIENT_SECRET"),
                   let client = parse(source: source) else { continue }
             return client
         }
@@ -68,7 +69,26 @@ struct GeminiOAuthClient {
                 files.append(root.appendingPathComponent(relative).standardizedFileURL)
             }
         }
+        files += bundleChunks(under: roots)
         var seen: Set<String> = []
         return files.filter { seen.insert($0.path).inserted }
+    }
+
+    /// Newer bundled releases (e.g. Homebrew gemini-cli 0.36) split code into
+    /// `bundle/chunk-*.js`, and the OAuth constants live in one of those chunks rather
+    /// than in `bundle/gemini.js`.
+    static func bundleChunks(under roots: [URL]) -> [URL] {
+        var files: [URL] = []
+        for root in roots {
+            let bundle = root.lastPathComponent == "bundle" ? root : root.appendingPathComponent("bundle")
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: bundle, includingPropertiesForKeys: nil
+            ) else { continue }
+            files += entries
+                .filter { $0.pathExtension == "js" && $0.lastPathComponent.hasPrefix("chunk-") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .map(\.standardizedFileURL)
+        }
+        return files
     }
 }
